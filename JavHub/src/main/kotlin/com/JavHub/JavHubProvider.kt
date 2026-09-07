@@ -19,6 +19,17 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 private fun String.decodeHtmlEntities(): String = Parser.unescapeEntities(this, false)
 
+// Extension function for Jav Guru reverse ID logic
+private fun String.edoceD(): String {
+    var x = this.length - 1
+    var edoceD = ""
+    while (x >= 0) {
+        edoceD += this[x]
+        x--
+    }
+    return edoceD
+}
+
 // Converts direct video streams to master playlists if needed
 private fun String.toPlaylistM3u8(): String {
     val perResolutionSegment = Regex("""/(?:\d{3,5}x\d{3,5}|\d{3,4}p)/[^/]+\.m3u8""")
@@ -39,6 +50,12 @@ data class LoadData(
 
 data class JavHDAjaxResponse(
     @JsonProperty("html") val html: String? = null
+)
+
+data class JavtifulResponse(
+    @JsonProperty("playlists_active") val playlistsActive: Long? = null,
+    @JsonProperty("playlists") val playlists: String? = null,
+    @JsonProperty("playlist_source") val playlistSource: String? = null,
 )
 
 class JavHubProvider : MainAPI() {
@@ -163,8 +180,6 @@ class JavHubProvider : MainAPI() {
             imgEl?.attr("src")?.ifBlank { null } ?: imgEl?.attr("data-src")
         )
 
-        // FIX: url must be a static static string (href) for Cloudstream's Continue Watching (Watch Sync) to work. 
-        // DO NOT pass the JSON string here.
         return newMovieSearchResponse(title, href, TvType.Movie) {
             this.posterUrl = posterUrl
             this.posterHeaders = mapOf("Referer" to "https://javhd.today/")
@@ -172,7 +187,6 @@ class JavHubProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        // If url is somehow still JSON from an older cache, safely fall back
         val loadData = runCatching { parseJson<LoadData>(url) }.getOrNull()
         var videoUrl = loadData?.url ?: url
 
@@ -231,7 +245,6 @@ class JavHubProvider : MainAPI() {
 
         val plotText = fetchedDescription?.ifBlank { null } ?: rawTitle
         
-        // FIX: The JSON payload is purely assigned to `dataUrl` so `loadLinks` can use it without breaking Watch Sync.
         val loadDataJson = LoadData(videoUrl, verticalPoster, code).toJson()
 
         return newMovieLoadResponse(title, videoUrl, TvType.Movie, loadDataJson) {
@@ -345,7 +358,106 @@ class JavHubProvider : MainAPI() {
                 }
             }
 
-            // 3. SUBTITLES
+            // 3. JAVTIFUL
+            launch {
+                runCatching {
+                    val javtifulSearchDoc = app.get("https://javtiful.com/search?q=$cleanCode").document
+                    val path = javtifulSearchDoc.selectFirst("body > main > section.front-section > div > div.front-video-grid > article > a")?.attr("href")
+                    
+                    if (!path.isNullOrBlank()) {
+                        val fullUrl = if (path.startsWith("http")) path else "https://javtiful.com$path"
+                        val document = app.get(fullUrl).document
+                        val token = document.selectFirst("#token_full")?.attr("data-csrf-token") ?: ""
+                        val script = document.selectFirst("script:containsData(vcpov)")?.data()
+                        val postid = script?.let { Regex("""vcpov\s*=\s*`(.*?)`""").find(it)?.groupValues?.get(1) } ?: ""
+                
+                        if (postid.isNotBlank()) {
+                            val form = mapOf("video_id" to postid, "pid_c" to "", "token" to token)
+                            val m3u8 = app.post("https://javtiful.com/ajax/get_cdn", data = form).parsedSafe<JavtifulResponse>()?.playlists
+                            if (!m3u8.isNullOrBlank()) {
+                                callback.invoke(
+                                    newExtractorLink(
+                                        "Javtiful",
+                                        "Javtiful",
+                                        m3u8,
+                                        ExtractorLinkType.M3U8
+                                    ) {
+                                        this.referer = "https://javtiful.com/"
+                                        this.quality = Qualities.Unknown.value
+                                    }
+                                )
+                                foundStream.set(true)
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 4. JAV GURU
+            launch {
+                runCatching {
+                    val guruDoc = app.get("https://jav.guru/$cleanCode").document
+                    val script = guruDoc.select("script:containsData(iframe_url)").html()
+                    val iframeUrls = Regex(""""iframe_url":"([^"]+)"""").findAll(script)
+                        .map { it.groupValues[1] }
+                        .map { String(Base64.decode(it, Base64.DEFAULT)) }
+                        .toList()
+        
+                    iframeUrls.forEach { iframeUrl ->
+                        runCatching {
+                            val iframeHtml = app.get(iframeUrl, referer = iframeUrl).text
+                            val olid = iframeHtml.substringAfter("var OLID = '").substringBefore("'")
+                            val newreq = iframeHtml.substringAfter("iframe").substringAfter("src=\"").substringBefore("'+OLID")
+                            val reverseid = olid.edoceD()
+                            
+                            if (olid.isNotBlank() && newreq.isNotBlank()) {
+                                val location = app.get("$newreq$reverseid", referer = iframeUrl, allowRedirects = false)
+                                val link = location.headers["location"] ?: location.headers["Location"]
+                                
+                                if (!link.isNullOrBlank()) {
+                                    if (link.contains(".m3u")) {
+                                        callback.invoke(
+                                            newExtractorLink(
+                                                "Jav Guru",
+                                                "Jav Guru",
+                                                link,
+                                                ExtractorLinkType.M3U8
+                                            ) {
+                                                this.referer = ""
+                                                this.quality = Qualities.Unknown.value
+                                            }
+                                        )
+                                        foundStream.set(true)
+                                    } else {
+                                        loadExtractor(link, referer = iframeUrl, subtitleCallback, callback)
+                                        foundStream.set(true)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 5. JAVHD (Cloudwish Extractor)
+            launch {
+                runCatching {
+                    val videoId = Regex("""/(\d{4,8})/""").find(videoUrl)?.groupValues?.get(1)
+                    if (videoId != null) {
+                        val embedUrl = "https://javhd.today/embed/$videoId"
+                        val embedDoc = app.get(embedUrl, headers = browserHeaders, timeout = 20).document
+                        val cloudwishEncoded = embedDoc.selectFirst(".server-option[data-name=Cloudwish]")?.attr("data-embed")
+                        
+                        if (!cloudwishEncoded.isNullOrBlank()) {
+                            val cloudwishUrl = String(Base64.decode(cloudwishEncoded, Base64.DEFAULT))
+                            loadExtractor(cloudwishUrl, referer = embedUrl, subtitleCallback, callback)
+                            foundStream.set(true)
+                        }
+                    }
+                }
+            }
+
+            // 6. SUBTITLES
             launch {
                 runCatching {
                     val searchDoc = app.get("$subtitleCatUrl/index.php?search=$code", timeout = 15, headers = browserHeaders).document
