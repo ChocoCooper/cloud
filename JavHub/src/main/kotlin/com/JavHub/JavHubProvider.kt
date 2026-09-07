@@ -58,7 +58,7 @@ class JavHubProvider : MainAPI() {
     override var lang                 = "en"
     override val hasDownloadSupport   = true
     override val hasChromecastSupport = true
-    override val supportedTypes       = setOf(TvType.Movie)
+    override val supportedTypes       = setOf(TvType.NSFW)
 
     private val browserHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -173,7 +173,7 @@ class JavHubProvider : MainAPI() {
             imgEl?.attr("src")?.ifBlank { null } ?: imgEl?.attr("data-src")
         )
 
-        return newMovieSearchResponse(title, href, TvType.Movie) {
+        return newMovieSearchResponse(title, href, TvType.NSFW) {
             this.posterUrl = posterUrl
             this.posterHeaders = mapOf("Referer" to "https://javhd.today/")
         }
@@ -240,7 +240,7 @@ class JavHubProvider : MainAPI() {
         
         val loadDataJson = LoadData(videoUrl, verticalPoster, code).toJson()
 
-        return newMovieLoadResponse(title, videoUrl, TvType.Movie, loadDataJson) {
+        return newMovieLoadResponse(title, videoUrl, TvType.NSFW, loadDataJson) {
             this.posterUrl = verticalPoster
             this.posterHeaders = mapOf("User-Agent" to browserHeaders["User-Agent"]!!)
             this.backgroundPosterUrl = horizontalPoster
