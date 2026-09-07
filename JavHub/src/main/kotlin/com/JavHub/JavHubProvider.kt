@@ -19,17 +19,6 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 private fun String.decodeHtmlEntities(): String = Parser.unescapeEntities(this, false)
 
-// Extension function for Jav Guru reverse ID logic
-private fun String.edoceD(): String {
-    var x = this.length - 1
-    var edoceD = ""
-    while (x >= 0) {
-        edoceD += this[x]
-        x--
-    }
-    return edoceD
-}
-
 // Converts direct video streams to master playlists if needed
 private fun String.toPlaylistM3u8(): String {
     val perResolutionSegment = Regex("""/(?:\d{3,5}x\d{3,5}|\d{3,4}p)/[^/]+\.m3u8""")
@@ -52,10 +41,14 @@ data class JavHDAjaxResponse(
     @JsonProperty("html") val html: String? = null
 )
 
-data class JavtifulResponse(
-    @JsonProperty("playlists_active") val playlistsActive: Long? = null,
-    @JsonProperty("playlists") val playlists: String? = null,
-    @JsonProperty("playlist_source") val playlistSource: String? = null,
+// Data classes to parse Javtiful's embedded JSON config
+data class JavtifulSource(
+    @JsonProperty("src") val src: String? = null,
+    @JsonProperty("type") val type: String? = null
+)
+
+data class JavtifulWatchConfig(
+    @JsonProperty("playerSources") val playerSources: List<JavtifulSource>? = null
 )
 
 class JavHubProvider : MainAPI() {
@@ -358,31 +351,30 @@ class JavHubProvider : MainAPI() {
                 }
             }
 
-            // 3. JAVTIFUL
+            // 3. JAVTIFUL (Bypassing JSON Post - using direct embedded config)
             launch {
                 runCatching {
-                    val javtifulSearchDoc = app.get("https://javtiful.com/search?q=$cleanCode").document
+                    val javtifulSearchDoc = app.get("https://javtiful.com/search?q=$cleanCode", headers = browserHeaders).document
                     val path = javtifulSearchDoc.selectFirst("body > main > section.front-section > div > div.front-video-grid > article > a")?.attr("href")
+                        ?: javtifulSearchDoc.selectFirst("article > a")?.attr("href")
                     
                     if (!path.isNullOrBlank()) {
                         val fullUrl = if (path.startsWith("http")) path else "https://javtiful.com$path"
-                        val document = app.get(fullUrl).document
-                        val token = document.selectFirst("#token_full")?.attr("data-csrf-token") ?: ""
-                        val script = document.selectFirst("script:containsData(vcpov)")?.data()
-                        val postid = script?.let { Regex("""vcpov\s*=\s*`(.*?)`""").find(it)?.groupValues?.get(1) } ?: ""
-                
-                        if (postid.isNotBlank()) {
-                            val form = mapOf("video_id" to postid, "pid_c" to "", "token" to token)
-                            val m3u8 = app.post("https://javtiful.com/ajax/get_cdn", data = form).parsedSafe<JavtifulResponse>()?.playlists
-                            if (!m3u8.isNullOrBlank()) {
+                        val document = app.get(fullUrl, headers = browserHeaders).document
+                        
+                        val scriptData = document.select("script#frontWatchConfig").html()
+                        val config = parseJson<JavtifulWatchConfig>(scriptData)
+                        
+                        config.playerSources?.forEach { source ->
+                            if (!source.src.isNullOrBlank()) {
                                 callback.invoke(
                                     newExtractorLink(
                                         "Javtiful",
                                         "Javtiful",
-                                        m3u8,
-                                        ExtractorLinkType.M3U8
+                                        source.src,
+                                        if (source.src.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                                     ) {
-                                        this.referer = "https://javtiful.com/"
+                                        this.referer = fullUrl
                                         this.quality = Qualities.Unknown.value
                                     }
                                 )
@@ -393,10 +385,10 @@ class JavHubProvider : MainAPI() {
                 }
             }
 
-            // 4. JAV GURU
+            // 4. JAV GURU (Dynamic Extractor & JavClan Unpacker)
             launch {
                 runCatching {
-                    val guruDoc = app.get("https://jav.guru/$cleanCode").document
+                    val guruDoc = app.get("https://jav.guru/$cleanCode", headers = browserHeaders).document
                     val script = guruDoc.select("script:containsData(iframe_url)").html()
                     val iframeUrls = Regex(""""iframe_url":"([^"]+)"""").findAll(script)
                         .map { it.groupValues[1] }
@@ -405,32 +397,65 @@ class JavHubProvider : MainAPI() {
         
                     iframeUrls.forEach { iframeUrl ->
                         runCatching {
-                            val iframeHtml = app.get(iframeUrl, referer = iframeUrl).text
-                            val olid = iframeHtml.substringAfter("var OLID = '").substringBefore("'")
-                            val newreq = iframeHtml.substringAfter("iframe").substringAfter("src=\"").substringBefore("'+OLID")
-                            val reverseid = olid.edoceD()
+                            val iframeHtml = app.get(iframeUrl, referer = iframeUrl, headers = browserHeaders).text
+                            val iframeDoc = Jsoup.parse(iframeHtml)
                             
-                            if (olid.isNotBlank() && newreq.isNotBlank()) {
-                                val location = app.get("$newreq$reverseid", referer = iframeUrl, allowRedirects = false)
-                                val link = location.headers["location"] ?: location.headers["Location"]
+                            val baseMatch = Regex("""base:\s*['"]([^'"]+)['"]""").find(iframeHtml)?.groupValues?.get(1)
+                            val rtypeMatch = Regex("""rtype:\s*['"]([^'"]+)['"]""").find(iframeHtml)?.groupValues?.get(1)
+                            val cidMatch = Regex("""cid:\s*['"]([^'"]+)['"]""").find(iframeHtml)?.groupValues?.get(1)
+                            
+                            val keysStr = Regex("""keys:\s*\[(.*?)\]""").find(iframeHtml)?.groupValues?.get(1)
+                            val keys = keysStr?.split(",")?.map { it.trim(' ', '\'', '"') }
+                            
+                            if (baseMatch != null && rtypeMatch != null && cidMatch != null && !keys.isNullOrEmpty()) {
+                                val targetDiv = iframeDoc.selectFirst("#$cidMatch")
                                 
-                                if (!link.isNullOrBlank()) {
-                                    if (link.contains(".m3u")) {
-                                        callback.invoke(
-                                            newExtractorLink(
-                                                "Jav Guru",
-                                                "Jav Guru",
-                                                link,
-                                                ExtractorLinkType.M3U8
-                                            ) {
-                                                this.referer = ""
-                                                this.quality = Qualities.Unknown.value
+                                if (targetDiv != null) {
+                                    val p1 = targetDiv.attr(keys.getOrNull(0) ?: "")
+                                    val p2 = targetDiv.attr(keys.getOrNull(1) ?: "")
+                                    val p3 = targetDiv.attr(keys.getOrNull(2) ?: "")
+                                    
+                                    val fullToken = p1 + p2 + p3
+                                    val reverseToken = fullToken.reversed()
+                                    
+                                    val finalUrl = "$baseMatch?$rtypeMatch" + "r=$reverseToken"
+                                    
+                                    val locRes = app.get(finalUrl, referer = iframeUrl, allowRedirects = false, headers = browserHeaders)
+                                    val link = locRes.headers["Location"] ?: locRes.headers["location"]
+                                    
+                                    if (!link.isNullOrBlank()) {
+                                        if (link.contains(".m3u")) {
+                                            callback.invoke(
+                                                newExtractorLink("Jav Guru", "Jav Guru", link, ExtractorLinkType.M3U8) {
+                                                    this.referer = iframeUrl
+                                                    this.quality = Qualities.Unknown.value
+                                                }
+                                            )
+                                            foundStream.set(true)
+                                        } else {
+                                            // Passing iframeUrl as referer prevents "Embed restricted" error
+                                            loadExtractor(link, referer = iframeUrl, subtitleCallback, callback)
+                                            
+                                            // Fallback just in case Cloudstream lacks the specific extractor plugin for JavClan
+                                            runCatching {
+                                                val embedHtml = app.get(link, referer = iframeUrl, headers = browserHeaders).text
+                                                // Cloudstream's native getAndUnpack handles complex packers robustly
+                                                val unpacked = getAndUnpack(embedHtml)
+                                                
+                                                val directMatch = Regex("""(https?://[^\s'\"<>]+?\.(?:m3u8|mp4)[^\s'\"<>]*)""").find(unpacked)?.groupValues?.get(1)
+                                                    ?: Regex("""(https?://[^\s'\"<>]+?\.(?:m3u8|mp4)[^\s'\"<>]*)""").find(embedHtml)?.groupValues?.get(1)
+                                                    
+                                                if (directMatch != null) {
+                                                     callback.invoke(
+                                                        newExtractorLink("Jav Guru (Direct)", "Jav Guru", directMatch, if (directMatch.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
+                                                            this.referer = link
+                                                            this.quality = Qualities.Unknown.value
+                                                        }
+                                                    )
+                                                    foundStream.set(true)
+                                                }
                                             }
-                                        )
-                                        foundStream.set(true)
-                                    } else {
-                                        loadExtractor(link, referer = iframeUrl, subtitleCallback, callback)
-                                        foundStream.set(true)
+                                        }
                                     }
                                 }
                             }
