@@ -19,17 +19,6 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 private fun String.decodeHtmlEntities(): String = Parser.unescapeEntities(this, false)
 
-// Extension function for Jav Guru reverse ID logic
-private fun String.edoceD(): String {
-    var x = this.length - 1
-    var edoceD = ""
-    while (x >= 0) {
-        edoceD += this[x]
-        x--
-    }
-    return edoceD
-}
-
 // Converts direct video streams to master playlists if needed
 private fun String.toPlaylistM3u8(): String {
     val perResolutionSegment = Regex("""/(?:\d{3,5}x\d{3,5}|\d{3,4}p)/[^/]+\.m3u8""")
@@ -362,7 +351,7 @@ class JavHubProvider : MainAPI() {
                 }
             }
 
-            // 3. JAVTIFUL (Perfected JSON parsing)
+            // 3. JAVTIFUL (Cleaned name without resolutions)
             launch {
                 runCatching {
                     val javtifulSearchDoc = app.get("https://javtiful.com/search?q=$cleanCode", headers = browserHeaders).document
@@ -386,7 +375,7 @@ class JavHubProvider : MainAPI() {
                                             if (source.src.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                                         ) {
                                             this.referer = "https://javtiful.com/"
-                                            this.quality = source.size ?: Qualities.Unknown.value
+                                            this.quality = Qualities.Unknown.value
                                         }
                                     )
                                     foundStream.set(true)
@@ -397,128 +386,7 @@ class JavHubProvider : MainAPI() {
                 }
             }
 
-            // 4. JAV GURU -> JAVCLAN/MAXSTREAM (403 Origin Bypass)
-            launch {
-                runCatching {
-                    val guruDoc = app.get("https://jav.guru/$cleanCode", headers = browserHeaders).document
-                    val script = guruDoc.select("script:containsData(iframe_url)").html()
-                    val iframeUrls = Regex(""""iframe_url":"([^"]+)"""").findAll(script)
-                        .map { it.groupValues[1] }
-                        .map { String(Base64.decode(it, Base64.DEFAULT)) }
-                        .toList()
-        
-                    iframeUrls.forEach { iframeUrl ->
-                        runCatching {
-                            val iframeHtml = app.get(iframeUrl, referer = iframeUrl, headers = browserHeaders).text
-                            val iframeDoc = Jsoup.parse(iframeHtml)
-                            
-                            val baseMatch = Regex("""base:\s*['"]([^'"]+)['"]""").find(iframeHtml)?.groupValues?.get(1)
-                            val rtypeMatch = Regex("""rtype:\s*['"]([^'"]+)['"]""").find(iframeHtml)?.groupValues?.get(1)
-                            val cidMatch = Regex("""cid:\s*['"]([^'"]+)['"]""").find(iframeHtml)?.groupValues?.get(1)
-                            val keysStr = Regex("""keys:\s*\[(.*?)\]""").find(iframeHtml)?.groupValues?.get(1)
-                            val keys = keysStr?.split(",")?.map { it.trim(' ', '\'', '"') }
-                            
-                            if (baseMatch != null && rtypeMatch != null && cidMatch != null && !keys.isNullOrEmpty()) {
-                                val targetDiv = iframeDoc.selectFirst("#$cidMatch")
-                                if (targetDiv != null) {
-                                    val token = keys.joinToString("") { targetDiv.attr(it) ?: "" }
-                                    val finalRedirect = "$baseMatch?$rtypeMatch" + "r=${token.reversed()}"
-                                    
-                                    val locRes = app.get(finalRedirect, referer = iframeUrl, allowRedirects = false, headers = browserHeaders)
-                                    val embedUrl = locRes.headers["Location"] ?: locRes.headers["location"]
-                                    
-                                    if (!embedUrl.isNullOrBlank()) {
-                                        // Manual Extractor to fix the 403 error by forcing the Origin header
-                                        val embedHtml = app.get(embedUrl, referer = iframeUrl, headers = browserHeaders).text
-                                        val unpacked = getAndUnpack(embedHtml) // Native Cloudstream JS Unpacker
-                                        
-                                        val m3u8 = Regex("""(https?://[^\s'\"<>]+?\.m3u8[^\s'\"<>]*)""").find(unpacked)?.groupValues?.get(1)
-                                            ?: Regex("""(https?://[^\s'\"<>]+?\.mp4[^\s'\"<>]*)""").find(unpacked)?.groupValues?.get(1)
-                                            
-                                        if (m3u8 != null) {
-                                            val origin = Regex("""https?://[^/]+""").find(embedUrl)?.value ?: "https://maxstream.org"
-                                            callback.invoke(
-                                                newExtractorLink(
-                                                    "Jav Guru (Maxstream)",
-                                                    "Jav Guru",
-                                                    m3u8,
-                                                    if (m3u8.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                                                ) {
-                                                    this.referer = embedUrl
-                                                    this.headers = mapOf(
-                                                        "Origin" to origin,
-                                                        "User-Agent" to browserHeaders["User-Agent"]!!
-                                                    )
-                                                    this.quality = Qualities.Unknown.value
-                                                }
-                                            )
-                                            foundStream.set(true)
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 5. JAVHD -> CLOUDWISH (AJAX Search + 403 Origin Bypass)
-            launch {
-                runCatching {
-                    val ajaxHeaders = mapOf(
-                        "X-Requested-With" to "XMLHttpRequest",
-                        "Referer" to "$mainUrl/",
-                        "Accept" to "application/json, text/javascript, */*; q=0.01"
-                    ) + browserHeaders
-
-                    val searchUrl = "$mainUrl/search/video/?s=$cleanCode&page=1&ajax=1"
-                    
-                    val ajaxRes = app.get(searchUrl, headers = ajaxHeaders, timeout = 15).text
-                    val html = runCatching { parseJson<JavHDAjaxResponse>(ajaxRes) }.getOrNull()?.html ?: return@runCatching
-                    
-                    val href = Jsoup.parse(html).selectFirst("div.video a")?.attr("href")
-                    val vid = Regex("""/(\d{4,8})/""").find(href ?: "")?.groupValues?.get(1)
-                    
-                    if (vid != null) {
-                        val embedUrl = "$mainUrl/embed/$vid"
-                        val embedDoc = app.get(embedUrl, headers = browserHeaders).document
-                        val cloudwishEncoded = embedDoc.selectFirst(".server-option[data-name=Cloudwish]")?.attr("data-embed")
-                        
-                        if (!cloudwishEncoded.isNullOrBlank()) {
-                            val cwUrl = String(Base64.decode(cloudwishEncoded, Base64.DEFAULT))
-                            
-                            // Manually unpack to inject Origin header
-                            val cwHtml = app.get(cwUrl, referer = embedUrl, headers = browserHeaders).text
-                            val unpacked = getAndUnpack(cwHtml)
-                            
-                            val m3u8 = Regex("""(https?://[^\s'\"<>]+?\.m3u8[^\s'\"<>]*)""").find(unpacked)?.groupValues?.get(1)
-                                ?: Regex("""(https?://[^\s'\"<>]+?\.mp4[^\s'\"<>]*)""").find(unpacked)?.groupValues?.get(1)
-                                
-                            if (m3u8 != null) {
-                                val origin = Regex("""https?://[^/]+""").find(cwUrl)?.value ?: "https://cloudwish.xyz"
-                                callback.invoke(
-                                    newExtractorLink(
-                                        "Cloudwish",
-                                        "Cloudwish",
-                                        m3u8,
-                                        if (m3u8.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                                    ) {
-                                        this.referer = embedUrl
-                                        this.headers = mapOf(
-                                            "Origin" to origin,
-                                            "User-Agent" to browserHeaders["User-Agent"]!!
-                                        )
-                                        this.quality = Qualities.Unknown.value
-                                    }
-                                )
-                                foundStream.set(true)
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 6. SUBTITLES
+            // 4. SUBTITLES
             launch {
                 runCatching {
                     val searchDoc = app.get("$subtitleCatUrl/index.php?search=$code", timeout = 15, headers = browserHeaders).document
