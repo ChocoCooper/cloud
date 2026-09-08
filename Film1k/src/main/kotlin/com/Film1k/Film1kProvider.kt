@@ -61,7 +61,6 @@ class Film1kProvider : MainAPI() {
     private val openSubtitlesMaxResults = 10
 
     override val mainPage = mainPageOf(
-        "$mainUrl/" to "Erotic Movies",
         "$mainUrl/tag/usa" to "USA Movies",
         "$mainUrl/tag/1990s" to "1990s Movies"
     )
@@ -85,34 +84,21 @@ class Film1kProvider : MainAPI() {
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-        val homeDoc = app.get("$mainUrl/", verify = false).document
         val usaDoc = app.get("$mainUrl/tag/usa", verify = false).document
         val nintiesDoc = app.get("$mainUrl/tag/1990s", verify = false).document
 
         val homePageList = mutableListOf<HomePageList>()
 
-        val latestTitle = homeDoc.selectFirst("#Ez-Wp > div > div > div > main > section > div.page-top > h3")?.text() ?: "Latest Movies"
-        val latestItems = parseArticles(homeDoc)
-        if (latestItems.isNotEmpty()) {
-            homePageList.add(HomePageList(latestTitle, latestItems, isHorizontalImages = isHorizontalImages))
-        }
-
         val usaTitle = usaDoc.selectFirst("#Ez-Wp > div > div > div > main > section > div.page-top > h3")?.text() ?: "USA Movies"
-        val usaItems = parseArticles(usaDoc)
+        val usaItems = parseArticles(usaDoc, limit = 7)
         if (usaItems.isNotEmpty()) {
             homePageList.add(HomePageList(usaTitle, usaItems, isHorizontalImages = isHorizontalImages))
         }
 
         val nintiesTitle = nintiesDoc.selectFirst("#Ez-Wp > div > div > div > main > section > div.page-top > h3")?.text() ?: "1990s Movies"
-        val nintiesItems = parseArticles(nintiesDoc)
+        val nintiesItems = parseArticles(nintiesDoc, limit = 7)
         if (nintiesItems.isNotEmpty()) {
             homePageList.add(HomePageList(nintiesTitle, nintiesItems, isHorizontalImages = isHorizontalImages))
-        }
-
-        val usaUrls = usaItems.map { it.url }.toSet()
-        val intersectionItems = nintiesItems.filter { usaUrls.contains(it.url) }
-        if (intersectionItems.isNotEmpty()) {
-            homePageList.add(HomePageList("1990s USA Movies", intersectionItems, isHorizontalImages = isHorizontalImages))
         }
 
         return newHomePageResponse(homePageList)
@@ -120,7 +106,6 @@ class Film1kProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val page1Url = "$mainUrl/?s=$query"
-        val page2Url = "$mainUrl/page/2?s=$query"
 
         val page1Items = try {
             parseArticles(app.get(page1Url, verify = false).document)
@@ -128,9 +113,16 @@ class Film1kProvider : MainAPI() {
             emptyList()
         }
 
-        val page2Items = try {
-            parseArticles(app.get(page2Url, verify = false).document)
-        } catch (e: Exception) {
+        // Page 2 is only worth its cost (another page fetch plus a full detail-page +
+        // OMDb crawl per item) when page 1 alone didn't give a solid result set.
+        val page2Items = if (page1Items.size < 10) {
+            try {
+                val page2Url = "$mainUrl/page/2?s=$query"
+                parseArticles(app.get(page2Url, verify = false).document)
+            } catch (e: Exception) {
+                emptyList()
+            }
+        } else {
             emptyList()
         }
 
@@ -138,8 +130,10 @@ class Film1kProvider : MainAPI() {
         return (page1Items + page2Items).filter { seenUrls.add(it.url) }
     }
 
-    private suspend fun parseArticles(doc: Document): List<SearchResponse> = coroutineScope {
-        val articles = doc.select("#Ez-Wp > div > div > div > main > section > article")
+    private suspend fun parseArticles(doc: Document, limit: Int? = null): List<SearchResponse> = coroutineScope {
+        val allArticles = doc.select("#Ez-Wp > div > div > div > main > section > article")
+        val articles = if (limit != null) allArticles.take(limit) else allArticles
+
         articles.map { article ->
             async {
                 val aHeader = article.selectFirst("header > a") ?: return@async null
@@ -148,26 +142,26 @@ class Film1kProvider : MainAPI() {
 
                 val rawName = article.selectFirst("header > a > h2")?.text()?.trim()?.takeIf { it.isNotBlank() }
                     ?: aHeader.text().trim()
-                val mediaName = cleanTitle(rawName)
+                val manualMediaName = cleanTitle(rawName)
 
                 val imgEl = article.selectFirst("header > a > figure > img")
-
                 val manualPosterUrl = imgEl?.let { el ->
                     el.attr("data-src").takeIf { it.isNotBlank() }
                         ?: el.attr("data-lazy-src").takeIf { it.isNotBlank() }
                         ?: el.attr("src").takeIf { it.isNotBlank() }
                 }?.let { fixUrl(it) }
 
-                // Listing pages have no IMDb link on them (only the detail page does), so this
-                // matches OMDb by title/year instead of crawling every item's page just to
-                // learn an id. A year-confidence check below guards against title collisions.
-                val (titleOnly, year) = extractYearAndTitle(mediaName)
-                val omdb = fetchOmdbByTitle(titleOnly, year)
+                // Visit the item's own page to grab its real IMDb id for an exact OMDb match -
+                // this is the accurate approach, at the cost of one extra page fetch per item.
+                val omdb = try {
+                    val detailDoc = app.get(mediaUrl, verify = false).document
+                    extractImdbId(detailDoc)?.let { fetchOmdbData(it) }
+                } catch (e: Exception) {
+                    null
+                }
 
-                val posterUrl = omdb
-                    ?.takeIf { yearMatches(year, it.Year) }
-                    ?.Poster
-                    ?.takeIf { it.isNotBlank() && !it.equals("N/A", ignoreCase = true) }
+                val mediaName = formatTitleWithYear(omdb?.Title, omdb?.Year) ?: manualMediaName
+                val posterUrl = omdb?.Poster?.takeIf { it.isNotBlank() && !it.equals("N/A", ignoreCase = true) }
                     ?: manualPosterUrl
 
                 newMovieSearchResponse(mediaName, mediaUrl, TvType.Movie) {
@@ -182,64 +176,44 @@ class Film1kProvider : MainAPI() {
         return Regex("tt\\d+").find(href)?.value
     }
 
+    // Tries one key first - this succeeds the overwhelming majority of the time, so there's
+    // no reason to burn quota on every other key for a request that would've worked anyway.
+    // Only if that fails (rate-limited/invalid/network hiccup) do we race the remaining keys
+    // in parallel, so recovery costs one round trip instead of up to N sequential retries.
     private suspend fun fetchOmdbData(imdbId: String): OmdbResponse? {
-        for (key in omdbApiKeys) {
-            try {
-                val responseText = app.get(
-                    "https://www.omdbapi.com/?i=$imdbId&apikey=$key&plot=full",
-                    verify = false
-                ).text
-                val parsed = tryParseJson<OmdbResponse>(responseText) ?: continue
-                if (parsed.Response?.equals("True", ignoreCase = true) == true) {
-                    return parsed
-                }
-            } catch (e: Exception) {
-                // this key failed or request errored, try the next key
-                continue
-            }
+        val firstKey = omdbApiKeys.firstOrNull() ?: return null
+        fetchOmdbWithKey(imdbId, firstKey)?.let { return it }
+
+        val remainingKeys = omdbApiKeys.drop(1)
+        if (remainingKeys.isEmpty()) return null
+
+        return coroutineScope {
+            remainingKeys
+                .map { key -> async { fetchOmdbWithKey(imdbId, key) } }
+                .awaitAll()
+                .firstOrNull { it != null }
         }
-        return null
     }
 
-    // For listing pages (homepage/search) there is no IMDb link to key off of yet,
-    // so fall back to a title (+ year, if we can parse one out) lookup instead.
-    private fun extractYearAndTitle(name: String): Pair<String, String?> {
-        val match = Regex("\\((\\d{4})\\)\\s*$").find(name) ?: return name to null
-        val year = match.groupValues[1]
-        val titleOnly = name.substring(0, match.range.first).trim()
-        return titleOnly.ifBlank { name } to year
-    }
-
-    // Guards against title collisions: only trust an OMDb match if its Year is within
-    // 1 year of the year we parsed off the scraped title. If we couldn't parse a year
-    // at all, there's nothing to check against, so the match is accepted as-is.
-    private fun yearMatches(expectedYear: String?, omdbYear: String?): Boolean {
-        if (expectedYear == null) return true
-        val expectedYearNum = expectedYear.toIntOrNull() ?: return true
-        val omdbYearNum = omdbYear?.let { Regex("\\d{4}").find(it)?.value?.toIntOrNull() } ?: return false
-        return kotlin.math.abs(omdbYearNum - expectedYearNum) <= 1
-    }
-
-    private suspend fun fetchOmdbByTitle(title: String, year: String? = null): OmdbResponse? {
-        if (title.isBlank()) return null
-        val encodedTitle = java.net.URLEncoder.encode(title, "UTF-8")
-        val yearParam = year?.let { "&y=$it" } ?: ""
-
-        for (key in omdbApiKeys) {
-            try {
-                val responseText = app.get(
-                    "https://www.omdbapi.com/?t=$encodedTitle$yearParam&apikey=$key&plot=short",
-                    verify = false
-                ).text
-                val parsed = tryParseJson<OmdbResponse>(responseText) ?: continue
-                if (parsed.Response?.equals("True", ignoreCase = true) == true) {
-                    return parsed
-                }
-            } catch (e: Exception) {
-                continue
-            }
+    private suspend fun fetchOmdbWithKey(imdbId: String, key: String): OmdbResponse? {
+        return try {
+            val responseText = app.get(
+                "https://www.omdbapi.com/?i=$imdbId&apikey=$key&plot=full",
+                verify = false
+            ).text
+            tryParseJson<OmdbResponse>(responseText)
+                ?.takeIf { it.Response?.equals("True", ignoreCase = true) == true }
+        } catch (e: Exception) {
+            null
         }
-        return null
+    }
+
+    // Produces the consistent "Title (Year)" display format used both on the
+    // homepage/search cards and on the load page, whenever OMDb gives us a title.
+    private fun formatTitleWithYear(title: String?, year: String?): String? {
+        val cleanedTitle = title?.takeIf { it.isNotBlank() && !it.equals("N/A", ignoreCase = true) } ?: return null
+        val cleanedYear = year?.let { Regex("\\d{4}").find(it)?.value }
+        return if (cleanedYear != null) "$cleanedTitle ($cleanedYear)" else cleanedTitle
     }
 
     private suspend fun fetchOpenSubtitles(imdbId: String): List<SubtitleFile> {
@@ -381,8 +355,7 @@ class Film1kProvider : MainAPI() {
         val imdbId = extractImdbId(doc)
         val omdb = imdbId?.let { fetchOmdbData(it) }
 
-        val mediaName = omdb?.Title?.takeIf { it.isNotBlank() && !it.equals("N/A", ignoreCase = true) }
-            ?: manualMediaName
+        val mediaName = formatTitleWithYear(omdb?.Title, omdb?.Year) ?: manualMediaName
 
         val posterUrl = omdb?.Poster?.takeIf { it.isNotBlank() && !it.equals("N/A", ignoreCase = true) }
             ?: manualPosterUrl
