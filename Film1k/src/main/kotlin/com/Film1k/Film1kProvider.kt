@@ -6,12 +6,54 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.jsoup.nodes.TextNode
 
+data class OmdbResponse(
+    val Title: String? = null,
+    val Plot: String? = null,
+    val Poster: String? = null,
+    val Genre: String? = null,
+    val Actors: String? = null,
+    val Response: String? = null
+)
+
+data class StremioSubtitle(
+    val id: String? = null,
+    val url: String? = null,
+    val lang: String? = null,
+    val score: Double? = null,
+    val downloads: Int? = null
+)
+
+data class StremioSubtitlesResponse(
+    val subtitles: List<StremioSubtitle>? = null
+)
+
 class Film1kProvider : MainAPI() {
     override var mainUrl = "https://www.film1k.com"
     override var name = "Film1k"
     override var lang = "en"
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.NSFW)
+
+    private val omdbApiKeys = listOf(
+        "4b447405",
+        "eb0c0475",
+        "7776cbde",
+        "ff28f90b",
+        "6c3a2d45",
+        "b07b58c8",
+        "ad04b643",
+        "a95b5205",
+        "777d9323",
+        "2c2c3314",
+        "b5cff164",
+        "89a9f57d",
+        "73a9858a",
+        "efbd8357"
+    )
+
+    // Stremio community OpenSubtitles addon - no API key required.
+    private val openSubtitlesBaseUrl = "https://opensubtitles-v3.strem.io/subtitles/movie"
+    private val openSubtitlesMaxResults = 10
 
     override val mainPage = mainPageOf(
         "$mainUrl/" to "Erotic Movies",
@@ -116,26 +158,98 @@ class Film1kProvider : MainAPI() {
         }
     }
 
+    private fun extractImdbId(doc: Document): String? {
+        val href = doc.selectFirst("a[href*=imdb.com/title/]")?.attr("href") ?: return null
+        return Regex("tt\\d+").find(href)?.value
+    }
+
+    private suspend fun fetchOmdbData(imdbId: String): OmdbResponse? {
+        for (key in omdbApiKeys) {
+            try {
+                val responseText = app.get(
+                    "https://www.omdbapi.com/?i=$imdbId&apikey=$key&plot=full",
+                    verify = false
+                ).text
+                val parsed = tryParseJson<OmdbResponse>(responseText) ?: continue
+                if (parsed.Response?.equals("True", ignoreCase = true) == true) {
+                    return parsed
+                }
+            } catch (e: Exception) {
+                // this key failed or request errored, try the next key
+                continue
+            }
+        }
+        return null
+    }
+
+    private suspend fun fetchOpenSubtitles(imdbId: String): List<SubtitleFile> {
+        val requestUrl = "$openSubtitlesBaseUrl/$imdbId.json"
+
+        val responseText = try {
+            app.get(requestUrl).text
+        } catch (e: Exception) {
+            return emptyList()
+        }
+
+        val parsed = tryParseJson<StremioSubtitlesResponse>(responseText) ?: return emptyList()
+
+        // English only ("eng" is the ISO 639-2 code this addon uses), most popular first.
+        return parsed.subtitles
+            ?.filter { it.lang.equals("eng", ignoreCase = true) && !it.url.isNullOrBlank() }
+            ?.sortedWith(
+                compareByDescending<StremioSubtitle> { it.downloads ?: -1 }
+                    .thenByDescending { it.score ?: -1.0 }
+            )
+            ?.take(openSubtitlesMaxResults)
+            ?.mapNotNull { sub -> sub.url?.let { SubtitleFile("English", it) } }
+            ?: emptyList()
+    }
+
+    private fun extractRecommendations(doc: Document): List<SearchResponse> {
+        val articles = doc.select("main > section article > header > a")
+        return articles.mapNotNull { aTag ->
+            val href = fixUrl(aTag.attr("href"))
+            if (href.isBlank()) return@mapNotNull null
+
+            val rawTitle = aTag.selectFirst("h2")?.text()?.trim()?.takeIf { it.isNotBlank() }
+                ?: aTag.text().trim()
+            if (rawTitle.isBlank()) return@mapNotNull null
+            val title = cleanTitle(rawTitle)
+
+            val imgEl = aTag.selectFirst("figure img")
+            val posterUrl = imgEl?.let { el ->
+                el.attr("data-src").takeIf { it.isNotBlank() }
+                    ?: el.attr("data-lazy-src").takeIf { it.isNotBlank() }
+                    ?: el.attr("src").takeIf { it.isNotBlank() }
+            }?.let { fixUrl(it) }
+
+            newMovieSearchResponse(title, href, TvType.Movie) {
+                this.posterUrl = posterUrl
+            }
+        }
+    }
+
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url, verify = false).document
 
+        // ---- Manual extraction (used as fallback if no IMDb id / OMDb lookup fails) ----
         val imgEl = doc.selectFirst("#Ez-Wp > div > div.Container > div > aside > div > div > img")
-        val realPoster = imgEl?.let { el ->
+        val manualPoster = imgEl?.let { el ->
             el.attr("data-src").takeIf { it.isNotBlank() }
                 ?: el.attr("data-lazy-src").takeIf { it.isNotBlank() }
                 ?: el.attr("src").takeIf { it.isNotBlank() && !it.startsWith("data:") }
         }
         val ogPoster = doc.selectFirst("meta[property=og:image]")?.attr("content")?.takeIf { it.isNotBlank() }
-        val posterUrl = (realPoster ?: ogPoster)?.let { fixUrl(it) }
+        val manualPosterUrl = (manualPoster ?: ogPoster)?.let { fixUrl(it) }
 
-        val rawName = imgEl?.attr("alt")?.takeIf { it.isNotBlank() }
+        val manualRawName = imgEl?.attr("alt")?.takeIf { it.isNotBlank() }
             ?: doc.selectFirst("h1.entry-title, h2.entry-title")?.text()?.trim()?.takeIf { it.isNotBlank() }
             ?: doc.selectFirst("meta[property=og:title]")?.attr("content")?.takeIf { it.isNotBlank() }
             ?: doc.title()
 
-        val mediaName = cleanTitle(rawName)
+        val manualMediaName = cleanTitle(manualRawName)
 
-        var plot: String? = null
+        var manualPlot: String? = null
         val descContainer = doc.selectFirst("#Ez-Wp > div > div.Container > div > aside > div > div")
 
         fun cleanupText(text: String): String {
@@ -191,9 +305,9 @@ class Film1kProvider : MainAPI() {
             return filtered.ifBlank { text }.ifBlank { null }
         }
 
-        plot = extractAfterLabel("Description") ?: extractAfterLabel("Plot") ?: extractTitleLeadParagraph()
+        manualPlot = extractAfterLabel("Description") ?: extractAfterLabel("Plot") ?: extractTitleLeadParagraph()
 
-        plot = plot?.let { cleanupText(it) }
+        manualPlot = manualPlot?.let { cleanupText(it) }
             ?.replace("^\\s*:\\s*".toRegex(), "")
             ?.replace("^\\s*\"|\"\\s*$".toRegex(), "")
             ?.trim()
@@ -201,12 +315,46 @@ class Film1kProvider : MainAPI() {
 
         val tags1 = doc.select("#Ez-Wp > div > div.Container > div > aside > div > p:nth-child(4) > a").map { it.text() }
         val tags2 = doc.select("#Ez-Wp > div > div.Container > div > aside > div > p:nth-child(6) > a").map { it.text() }
-        val allTags = (tags1 + tags2).filter { it.isNotBlank() }.distinct()
+        val manualTags = (tags1 + tags2).filter { it.isNotBlank() }.distinct()
+
+        // ---- IMDb id extraction + OMDb metadata enrichment ----
+        val imdbId = extractImdbId(doc)
+        val omdb = imdbId?.let { fetchOmdbData(it) }
+
+        val mediaName = omdb?.Title?.takeIf { it.isNotBlank() && !it.equals("N/A", ignoreCase = true) }
+            ?: manualMediaName
+
+        val posterUrl = omdb?.Poster?.takeIf { it.isNotBlank() && !it.equals("N/A", ignoreCase = true) }
+            ?: manualPosterUrl
+
+        val plot = omdb?.Plot?.takeIf { it.isNotBlank() && !it.equals("N/A", ignoreCase = true) }
+            ?: manualPlot
+
+        val allTags = omdb?.Genre?.takeIf { it.isNotBlank() && !it.equals("N/A", ignoreCase = true) }
+            ?.split(",")
+            ?.map { it.trim() }
+            ?.filter { it.isNotBlank() }
+            ?: manualTags
+
+        val actorsList = omdb?.Actors?.takeIf { it.isNotBlank() && !it.equals("N/A", ignoreCase = true) }
+            ?.split(",")
+            ?.map { it.trim() }
+            ?.filter { it.isNotBlank() }
+            ?: emptyList()
+
+        val recommendations = extractRecommendations(doc)
 
         return newMovieLoadResponse(mediaName, url, TvType.Movie, url) {
             this.posterUrl = posterUrl
+            this.backgroundPosterUrl = posterUrl
             this.plot = plot
             this.tags = allTags
+            if (actorsList.isNotEmpty()) {
+                this.actors = actorsList.map { ActorData(Actor(it)) }
+            }
+            if (recommendations.isNotEmpty()) {
+                this.recommendations = recommendations
+            }
         }
     }
 
@@ -218,6 +366,12 @@ class Film1kProvider : MainAPI() {
     ): Boolean {
         val doc = app.get(data, verify = false).document
         val extractedUrls = mutableSetOf<String>()
+
+        // ---- English subtitles via OpenSubtitles, sorted by popularity (download_count) ----
+        val imdbId = extractImdbId(doc)
+        if (imdbId != null) {
+            fetchOpenSubtitles(imdbId).forEach { subtitleCallback(it) }
+        }
 
         fun realSrc(el: Element): String? {
             return el.attr("data-src").takeIf { it.isNotBlank() }
