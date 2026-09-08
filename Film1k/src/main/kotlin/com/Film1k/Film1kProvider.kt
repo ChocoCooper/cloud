@@ -57,7 +57,7 @@ class Film1kProvider : MainAPI() {
         "73a9858a",
         "efbd8357"
     )
-    
+
     // Atomic integer to keep track of our round-robin key distribution
     private val currentKeyIndex = AtomicInteger(0)
 
@@ -83,6 +83,22 @@ class Film1kProvider : MainAPI() {
             .replace(Regex("\\s+"), " ")
             .trim(' ', '-', '|', ':')
             .trim()
+    }
+
+    // Helper to safely extract image URLs while ignoring base64 "data:" placeholders
+    private fun getImageUrl(el: Element?): String? {
+        if (el == null) return null
+        return el.attr("data-src").takeIf { it.isNotBlank() && !it.startsWith("data:") }
+            ?: el.attr("data-lazy-src").takeIf { it.isNotBlank() && !it.startsWith("data:") }
+            ?: el.attr("src").takeIf { it.isNotBlank() && !it.startsWith("data:") }
+    }
+
+    private fun extractDetailPoster(doc: Document): String? {
+        val imgEl = doc.selectFirst("#Ez-Wp > div > div.Container > div > aside > div > div > img")
+            ?: doc.selectFirst("article img")
+        val manualPoster = getImageUrl(imgEl)
+        val ogPoster = doc.selectFirst("meta[property=og:image]")?.attr("content")?.takeIf { it.isNotBlank() }
+        return manualPoster ?: ogPoster
     }
 
     override suspend fun getMainPage(
@@ -118,8 +134,7 @@ class Film1kProvider : MainAPI() {
             emptyList()
         }
 
-        // Page 2 is only worth its cost (another page fetch plus a full detail-page +
-        // OMDb crawl per item) when page 1 alone didn't give a solid result set.
+        // Page 2 is only worth its cost when page 1 alone didn't give a solid result set.
         val page2Items = if (page1Items.size < 10) {
             try {
                 val page2Url = "$mainUrl/page/2?s=$query"
@@ -141,32 +156,34 @@ class Film1kProvider : MainAPI() {
 
         articles.map { article ->
             async {
-                val aHeader = article.selectFirst("header > a") ?: return@async null
+                val aHeader = article.selectFirst("header > a") ?: article.selectFirst("a") ?: return@async null
                 val mediaUrl = fixUrl(aHeader.attr("href"))
                 if (mediaUrl.isBlank()) return@async null
 
-                val rawName = article.selectFirst("header > a > h2")?.text()?.trim()?.takeIf { it.isNotBlank() }
+                val rawName = article.selectFirst("h2")?.text()?.trim()?.takeIf { it.isNotBlank() }
                     ?: aHeader.text().trim()
                 val manualMediaName = cleanTitle(rawName)
 
-                val imgEl = article.selectFirst("header > a > figure > img")
-                val manualPosterUrl = imgEl?.let { el ->
-                    el.attr("data-src").takeIf { it.isNotBlank() }
-                        ?: el.attr("data-lazy-src").takeIf { it.isNotBlank() }
-                        ?: el.attr("src").takeIf { it.isNotBlank() }
-                }?.let { fixUrl(it) }
+                // Simpler image selector to capture more cases on search pages
+                val imgEl = article.selectFirst("img")
+                val manualPosterUrl = getImageUrl(imgEl)?.let { fixUrl(it) }
 
-                // Visit the item's own page to grab its real IMDb id for an exact OMDb match.
-                // Because we are in an async block, these fetches happen in parallel.
+                // Fetch detail page. Because we are in an async block, these fetches happen in parallel.
+                var detailPosterUrl: String? = null
                 val omdb = try {
                     val detailDoc = app.get(mediaUrl, verify = false).document
+                    // We grab the high-quality detail poster here just in case OMDb fails
+                    detailPosterUrl = extractDetailPoster(detailDoc)?.let { fixUrl(it) }
                     extractImdbId(detailDoc)?.let { fetchOmdbData(it) }
                 } catch (e: Exception) {
                     null
                 }
 
                 val mediaName = formatTitleWithYear(omdb?.Title, omdb?.Year) ?: manualMediaName
+                
+                // Priority fallback: OMDb > Detail Page Poster > Article Thumbnail Poster
                 val posterUrl = omdb?.Poster?.takeIf { it.isNotBlank() && !it.equals("N/A", ignoreCase = true) }
+                    ?: detailPosterUrl
                     ?: manualPosterUrl
 
                 newMovieSearchResponse(mediaName, mediaUrl, TvType.Movie) {
@@ -181,21 +198,15 @@ class Film1kProvider : MainAPI() {
         return Regex("tt\\d+").find(href)?.value
     }
 
-    // Tries a specific key from the pool first using round-robin distribution.
-    // This allows concurrent items (like the 14 movies on the homepage) to each use a different key simultaneously!
-    // If the assigned key fails, it safely falls back to racing the remaining keys.
+    // Distributes requests across all keys concurrently, acting identically for Homepage AND Search pages
     private suspend fun fetchOmdbData(imdbId: String): OmdbResponse? {
         if (omdbApiKeys.isEmpty()) return null
         
-        // Calculate the next round-robin index. 
-        // 'abs' guarantees it won't crash if the atomic integer eventually overflows into negatives.
         val primaryKeyIndex = abs(currentKeyIndex.getAndIncrement()) % omdbApiKeys.size
         val primaryKey = omdbApiKeys[primaryKeyIndex]
 
-        // Try the distributed primary key first.
         fetchOmdbWithKey(imdbId, primaryKey)?.let { return it }
 
-        // If the primary key fails (rate-limited/invalid/network hiccup), race the OTHER keys in parallel.
         val remainingKeys = omdbApiKeys.filterIndexed { index, _ -> index != primaryKeyIndex }
         if (remainingKeys.isEmpty()) return null
 
@@ -220,8 +231,6 @@ class Film1kProvider : MainAPI() {
         }
     }
 
-    // Produces the consistent "Title (Year)" display format used both on the
-    // homepage/search cards and on the load page, whenever OMDb gives us a title.
     private fun formatTitleWithYear(title: String?, year: String?): String? {
         val cleanedTitle = title?.takeIf { it.isNotBlank() && !it.equals("N/A", ignoreCase = true) } ?: return null
         val cleanedYear = year?.let { Regex("\\d{4}").find(it)?.value }
@@ -239,7 +248,6 @@ class Film1kProvider : MainAPI() {
 
         val parsed = tryParseJson<StremioSubtitlesResponse>(responseText) ?: return emptyList()
 
-        // English only ("eng" is the ISO 639-2 code this addon uses), most popular first.
         return parsed.subtitles
             ?.filter { it.lang.equals("eng", ignoreCase = true) && !it.url.isNullOrBlank() }
             ?.sortedWith(
@@ -262,12 +270,8 @@ class Film1kProvider : MainAPI() {
             if (rawTitle.isBlank()) return@mapNotNull null
             val title = cleanTitle(rawTitle)
 
-            val imgEl = aTag.selectFirst("figure img")
-            val posterUrl = imgEl?.let { el ->
-                el.attr("data-src").takeIf { it.isNotBlank() }
-                    ?: el.attr("data-lazy-src").takeIf { it.isNotBlank() }
-                    ?: el.attr("src").takeIf { it.isNotBlank() }
-            }?.let { fixUrl(it) }
+            val imgEl = aTag.selectFirst("figure img") ?: aTag.selectFirst("img")
+            val posterUrl = getImageUrl(imgEl)?.let { fixUrl(it) }
 
             newMovieSearchResponse(title, href, TvType.Movie) {
                 this.posterUrl = posterUrl
@@ -279,16 +283,9 @@ class Film1kProvider : MainAPI() {
         val doc = app.get(url, verify = false).document
 
         // ---- Manual extraction (used as fallback if no IMDb id / OMDb lookup fails) ----
-        val imgEl = doc.selectFirst("#Ez-Wp > div > div.Container > div > aside > div > div > img")
-        val manualPoster = imgEl?.let { el ->
-            el.attr("data-src").takeIf { it.isNotBlank() }
-                ?: el.attr("data-lazy-src").takeIf { it.isNotBlank() }
-                ?: el.attr("src").takeIf { it.isNotBlank() && !it.startsWith("data:") }
-        }
-        val ogPoster = doc.selectFirst("meta[property=og:image]")?.attr("content")?.takeIf { it.isNotBlank() }
-        val manualPosterUrl = (manualPoster ?: ogPoster)?.let { fixUrl(it) }
+        val manualPosterUrl = extractDetailPoster(doc)?.let { fixUrl(it) }
 
-        val manualRawName = imgEl?.attr("alt")?.takeIf { it.isNotBlank() }
+        val manualRawName = doc.selectFirst("#Ez-Wp > div > div.Container > div > aside > div > div > img")?.attr("alt")?.takeIf { it.isNotBlank() }
             ?: doc.selectFirst("h1.entry-title, h2.entry-title")?.text()?.trim()?.takeIf { it.isNotBlank() }
             ?: doc.selectFirst("meta[property=og:title]")?.attr("content")?.takeIf { it.isNotBlank() }
             ?: doc.title()
@@ -418,19 +415,13 @@ class Film1kProvider : MainAPI() {
             fetchOpenSubtitles(imdbId).forEach { subtitleCallback(it) }
         }
 
-        fun realSrc(el: Element): String? {
-            return el.attr("data-src").takeIf { it.isNotBlank() }
-                ?: el.attr("data-lazy-src").takeIf { it.isNotBlank() }
-                ?: el.attr("src").takeIf { it.isNotBlank() && !it.startsWith("data:") }
-        }
-
         doc.select("#my-video > source").forEach { source ->
-            val src = realSrc(source)
+            val src = getImageUrl(source)
             if (!src.isNullOrBlank()) extractedUrls.add(fixUrl(src))
         }
 
         doc.select("#video-op-a > div > iframe").forEach { iframe ->
-            val src = realSrc(iframe)
+            val src = getImageUrl(iframe)
             if (!src.isNullOrBlank()) extractedUrls.add(fixUrl(src))
         }
 
@@ -468,8 +459,6 @@ class Film1kProvider : MainAPI() {
             }
         }
 
-        // Deduplicate thoroughly by only emitting ONE optimal link. 
-        // Prioritizes M3U8 (which internally handles all qualities).
         var emitted = false
         val sortedLinks = collectedLinks.sortedByDescending { it.type == ExtractorLinkType.M3U8 }
 
