@@ -9,6 +9,8 @@ import kotlinx.coroutines.awaitAll
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.jsoup.nodes.TextNode
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.abs
 
 data class OmdbResponse(
     val Title: String? = null,
@@ -55,6 +57,9 @@ class Film1kProvider : MainAPI() {
         "73a9858a",
         "efbd8357"
     )
+    
+    // Atomic integer to keep track of our round-robin key distribution
+    private val currentKeyIndex = AtomicInteger(0)
 
     // Stremio community OpenSubtitles addon - no API key required.
     private val openSubtitlesBaseUrl = "https://opensubtitles-v3.strem.io/subtitles/movie"
@@ -151,8 +156,8 @@ class Film1kProvider : MainAPI() {
                         ?: el.attr("src").takeIf { it.isNotBlank() }
                 }?.let { fixUrl(it) }
 
-                // Visit the item's own page to grab its real IMDb id for an exact OMDb match -
-                // this is the accurate approach, at the cost of one extra page fetch per item.
+                // Visit the item's own page to grab its real IMDb id for an exact OMDb match.
+                // Because we are in an async block, these fetches happen in parallel.
                 val omdb = try {
                     val detailDoc = app.get(mediaUrl, verify = false).document
                     extractImdbId(detailDoc)?.let { fetchOmdbData(it) }
@@ -176,15 +181,22 @@ class Film1kProvider : MainAPI() {
         return Regex("tt\\d+").find(href)?.value
     }
 
-    // Tries one key first - this succeeds the overwhelming majority of the time, so there's
-    // no reason to burn quota on every other key for a request that would've worked anyway.
-    // Only if that fails (rate-limited/invalid/network hiccup) do we race the remaining keys
-    // in parallel, so recovery costs one round trip instead of up to N sequential retries.
+    // Tries a specific key from the pool first using round-robin distribution.
+    // This allows concurrent items (like the 14 movies on the homepage) to each use a different key simultaneously!
+    // If the assigned key fails, it safely falls back to racing the remaining keys.
     private suspend fun fetchOmdbData(imdbId: String): OmdbResponse? {
-        val firstKey = omdbApiKeys.firstOrNull() ?: return null
-        fetchOmdbWithKey(imdbId, firstKey)?.let { return it }
+        if (omdbApiKeys.isEmpty()) return null
+        
+        // Calculate the next round-robin index. 
+        // 'abs' guarantees it won't crash if the atomic integer eventually overflows into negatives.
+        val primaryKeyIndex = abs(currentKeyIndex.getAndIncrement()) % omdbApiKeys.size
+        val primaryKey = omdbApiKeys[primaryKeyIndex]
 
-        val remainingKeys = omdbApiKeys.drop(1)
+        // Try the distributed primary key first.
+        fetchOmdbWithKey(imdbId, primaryKey)?.let { return it }
+
+        // If the primary key fails (rate-limited/invalid/network hiccup), race the OTHER keys in parallel.
+        val remainingKeys = omdbApiKeys.filterIndexed { index, _ -> index != primaryKeyIndex }
         if (remainingKeys.isEmpty()) return null
 
         return coroutineScope {
