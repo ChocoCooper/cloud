@@ -3,12 +3,16 @@ package com.Film1k
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.jsoup.nodes.TextNode
 
 data class OmdbResponse(
     val Title: String? = null,
+    val Year: String? = null,
     val Plot: String? = null,
     val Poster: String? = null,
     val Genre: String? = null,
@@ -134,29 +138,43 @@ class Film1kProvider : MainAPI() {
         return (page1Items + page2Items).filter { seenUrls.add(it.url) }
     }
 
-    private fun parseArticles(doc: Document): List<SearchResponse> {
+    private suspend fun parseArticles(doc: Document): List<SearchResponse> = coroutineScope {
         val articles = doc.select("#Ez-Wp > div > div > div > main > section > article")
-        return articles.mapNotNull { article ->
-            val aHeader = article.selectFirst("header > a") ?: return@mapNotNull null
-            val mediaUrl = fixUrl(aHeader.attr("href"))
-            if (mediaUrl.isBlank()) return@mapNotNull null
+        articles.map { article ->
+            async {
+                val aHeader = article.selectFirst("header > a") ?: return@async null
+                val mediaUrl = fixUrl(aHeader.attr("href"))
+                if (mediaUrl.isBlank()) return@async null
 
-            val rawName = article.selectFirst("header > a > h2")?.text()?.trim()?.takeIf { it.isNotBlank() }
-                ?: aHeader.text().trim()
-            val mediaName = cleanTitle(rawName)
+                val rawName = article.selectFirst("header > a > h2")?.text()?.trim()?.takeIf { it.isNotBlank() }
+                    ?: aHeader.text().trim()
+                val mediaName = cleanTitle(rawName)
 
-            val imgEl = article.selectFirst("header > a > figure > img")
+                val imgEl = article.selectFirst("header > a > figure > img")
 
-            val posterUrl = imgEl?.let { el ->
-                el.attr("data-src").takeIf { it.isNotBlank() }
-                    ?: el.attr("data-lazy-src").takeIf { it.isNotBlank() }
-                    ?: el.attr("src").takeIf { it.isNotBlank() }
-            }?.let { fixUrl(it) }
+                val manualPosterUrl = imgEl?.let { el ->
+                    el.attr("data-src").takeIf { it.isNotBlank() }
+                        ?: el.attr("data-lazy-src").takeIf { it.isNotBlank() }
+                        ?: el.attr("src").takeIf { it.isNotBlank() }
+                }?.let { fixUrl(it) }
 
-            newMovieSearchResponse(mediaName, mediaUrl, TvType.Movie) {
-                this.posterUrl = posterUrl
+                // Listing pages have no IMDb link on them (only the detail page does), so this
+                // matches OMDb by title/year instead of crawling every item's page just to
+                // learn an id. A year-confidence check below guards against title collisions.
+                val (titleOnly, year) = extractYearAndTitle(mediaName)
+                val omdb = fetchOmdbByTitle(titleOnly, year)
+
+                val posterUrl = omdb
+                    ?.takeIf { yearMatches(year, it.Year) }
+                    ?.Poster
+                    ?.takeIf { it.isNotBlank() && !it.equals("N/A", ignoreCase = true) }
+                    ?: manualPosterUrl
+
+                newMovieSearchResponse(mediaName, mediaUrl, TvType.Movie) {
+                    this.posterUrl = posterUrl
+                }
             }
-        }
+        }.awaitAll().filterNotNull()
     }
 
     private fun extractImdbId(doc: Document): String? {
@@ -177,6 +195,47 @@ class Film1kProvider : MainAPI() {
                 }
             } catch (e: Exception) {
                 // this key failed or request errored, try the next key
+                continue
+            }
+        }
+        return null
+    }
+
+    // For listing pages (homepage/search) there is no IMDb link to key off of yet,
+    // so fall back to a title (+ year, if we can parse one out) lookup instead.
+    private fun extractYearAndTitle(name: String): Pair<String, String?> {
+        val match = Regex("\\((\\d{4})\\)\\s*$").find(name) ?: return name to null
+        val year = match.groupValues[1]
+        val titleOnly = name.substring(0, match.range.first).trim()
+        return titleOnly.ifBlank { name } to year
+    }
+
+    // Guards against title collisions: only trust an OMDb match if its Year is within
+    // 1 year of the year we parsed off the scraped title. If we couldn't parse a year
+    // at all, there's nothing to check against, so the match is accepted as-is.
+    private fun yearMatches(expectedYear: String?, omdbYear: String?): Boolean {
+        if (expectedYear == null) return true
+        val expectedYearNum = expectedYear.toIntOrNull() ?: return true
+        val omdbYearNum = omdbYear?.let { Regex("\\d{4}").find(it)?.value?.toIntOrNull() } ?: return false
+        return kotlin.math.abs(omdbYearNum - expectedYearNum) <= 1
+    }
+
+    private suspend fun fetchOmdbByTitle(title: String, year: String? = null): OmdbResponse? {
+        if (title.isBlank()) return null
+        val encodedTitle = java.net.URLEncoder.encode(title, "UTF-8")
+        val yearParam = year?.let { "&y=$it" } ?: ""
+
+        for (key in omdbApiKeys) {
+            try {
+                val responseText = app.get(
+                    "https://www.omdbapi.com/?t=$encodedTitle$yearParam&apikey=$key&plot=short",
+                    verify = false
+                ).text
+                val parsed = tryParseJson<OmdbResponse>(responseText) ?: continue
+                if (parsed.Response?.equals("True", ignoreCase = true) == true) {
+                    return parsed
+                }
+            } catch (e: Exception) {
                 continue
             }
         }
