@@ -65,13 +65,14 @@ class Film1kProvider : MainAPI() {
     private val imdbIdCache = mutableMapOf<String, String>()
 
     private val titleJunkRegex = Regex(
-        "full movie online|movie poster watch online|watch movie online|watch tv online|watch series online|movie poster|watch online",
+        "full movie online|movie poster watch online|watch movie online|watch tv online|watch series online|movie poster|watch online|film1k",
         RegexOption.IGNORE_CASE
     )
 
     private fun cleanTitle(raw: String): String {
         return raw
             .replace(titleJunkRegex, "")
+            .replace(Regex("\\(\\d{4}\\)"), "") // Automatically strip (YYYY) from site headers
             .replace(Regex("\\s+"), " ")
             .trim(' ', '-', '|', ':')
             .trim()
@@ -157,7 +158,8 @@ class Film1kProvider : MainAPI() {
 
         return try {
             val rawHtml = app.get(mediaUrl, verify = false, cacheTime = 1440).text
-            val id = Regex("tt\\d{7,8}").find(rawHtml)?.value
+            // Strict regex ensures we only grab IMDb IDs attached to actual IMDb links!
+            val id = Regex("imdb\\.com/title/(tt\\d{7,8})").find(rawHtml)?.groupValues?.get(1)
             if (id != null) {
                 imdbIdCache[mediaUrl] = id
             }
@@ -296,7 +298,6 @@ class Film1kProvider : MainAPI() {
         
         val plot = cinemeta?.description?.takeIf { it.isNotBlank() } ?: manualPlot
         
-        // Map Genres, Country, and Language into Cloudstream's Tag Chips safely
         val allTags = mutableListOf<String>()
         cinemeta?.genres?.let { allTags.addAll(it) }
         if (allTags.isEmpty() && manualTags.isNotEmpty()) {
