@@ -50,22 +50,25 @@ class Film1kProvider : MainAPI() {
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.NSFW)
 
-    // Cinemeta - Stremio's official metadata addon. No API key required.
+    // Cinemeta - Stremio's official metadata addon.
     private val cinemetaBaseUrl = "https://v3-cinemeta.strem.io/meta/movie"
-
-    // Caps how many listing items are processed concurrently to avoid network bottlenecking
-    private val listingConcurrency = Semaphore(5)
 
     // Stremio community OpenSubtitles addon
     private val openSubtitlesBaseUrl = "https://opensubtitles-v3.strem.io/subtitles/movie"
     private val openSubtitlesMaxResults = 10
 
+    // Concurrency limit to prevent network timeouts when fetching detail IDs
+    private val listingConcurrency = Semaphore(5)
+
+    // Memory cache to completely skip HTTP requests on repeat visits
+    private val imdbIdCache = mutableMapOf<String, String>()
+
+    private val isHorizontalImages = false
+
     override val mainPage = mainPageOf(
         "$mainUrl/tag/usa" to "USA Movies",
         "$mainUrl/tag/1990s" to "1990s Movies"
     )
-
-    private val isHorizontalImages = false
 
     private val titleJunkRegex = Regex(
         "full movie online|movie poster watch online|watch movie online|watch tv online|watch series online|movie poster|watch online|film1k",
@@ -75,7 +78,7 @@ class Film1kProvider : MainAPI() {
     private fun cleanTitle(raw: String): String {
         return raw
             .replace(titleJunkRegex, "")
-            .replace(Regex("\\(\\d{4}\\)"), "") // Strips (YYYY) automatically
+            .replace(Regex("\\(\\d{4}\\)"), "") // Automatically strip (YYYY)
             .replace(Regex("\\s+"), " ")
             .trim(' ', '-', '|', ':')
             .trim()
@@ -96,6 +99,7 @@ class Film1kProvider : MainAPI() {
         return manualPoster ?: ogPoster
     }
 
+    // Safely validates image URLs for load pages using HEAD requests
     private suspend fun getValidImageUrl(primaryUrl: String?, fallbackUrl: String?): String? {
         val primary = primaryUrl?.takeIf { it.isNotBlank() && !it.equals("N/A", ignoreCase = true) }
         val fallback = fallbackUrl?.takeIf { it.isNotBlank() }
@@ -114,7 +118,6 @@ class Film1kProvider : MainAPI() {
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-        // This utilizes Cloudstream's native tab generation and pagination perfectly.
         val url = if (page == 1) request.data else "${request.data}/page/$page/"
         
         val doc = try {
@@ -123,7 +126,8 @@ class Film1kProvider : MainAPI() {
             return newHomePageResponse(emptyList())
         }
 
-        val items = parseArticles(doc)
+        // We limit to 8 items per page load to ensure instantaneous homepage startup
+        val items = parseArticles(doc, limit = 8)
         
         return newHomePageResponse(
             list = HomePageList(
@@ -141,12 +145,15 @@ class Film1kProvider : MainAPI() {
         } catch (e: Exception) {
             return emptyList()
         }
-        return parseArticles(doc)
+        // Limit search to 12 to ensure results return quickly
+        return parseArticles(doc, limit = 12)
     }
 
-    private suspend fun parseArticles(doc: Document): List<SearchResponse> = coroutineScope {
-        val articles = doc.select("#Ez-Wp > div > div > div > main > section > article")
+    private suspend fun parseArticles(doc: Document, limit: Int? = null): List<SearchResponse> = coroutineScope {
+        val allArticles = doc.select("#Ez-Wp > div > div > div > main > section > article")
             .ifEmpty { doc.select("main > section article") }
+        
+        val articles = if (limit != null) allArticles.take(limit) else allArticles
 
         articles.map { article ->
             async {
@@ -162,20 +169,31 @@ class Film1kProvider : MainAPI() {
                     val imgEl = article.selectFirst("header > a > figure > img") ?: article.selectFirst("img")
                     val manualPosterUrl = getImageUrl(imgEl)?.let { fixUrl(it) }
 
-                    var detailPosterUrl: String? = null
-                    val cinemeta = try {
-                        val detailDoc = app.get(mediaUrl, verify = false, cacheTime = 1440).document
-                        detailPosterUrl = extractDetailPoster(detailDoc)?.let { fixUrl(it) }
-                        extractImdbId(detailDoc)?.let { fetchCinemetaData(it) }
-                    } catch (e: Exception) {
-                        null
+                    // Lightning fast regex extraction - skips JSoup DOM building entirely
+                    var imdbId = imdbIdCache[mediaUrl]
+                    var fastDetailPoster: String? = null
+
+                    if (imdbId == null) {
+                        try {
+                            val detailText = app.get(mediaUrl, verify = false, cacheTime = 1440).text
+                            imdbId = Regex("imdb\\.com/title/(tt\\d+)").find(detailText)?.groupValues?.get(1)
+                                ?: Regex("tt\\d{7,8}").find(detailText)?.value
+                            
+                            if (imdbId != null) {
+                                imdbIdCache[mediaUrl] = imdbId
+                            }
+                            fastDetailPoster = Regex("property=\"og:image\"\\s+content=\"([^\"]+)\"").find(detailText)?.groupValues?.get(1)
+                        } catch (e: Exception) {}
                     }
 
-                    val mediaName = getBestTitle(manualMediaName, cinemeta?.name)
+                    val cinemeta = imdbId?.let { fetchCinemetaData(it) }
+
+                    // Priority: Cinemeta -> Manual Scrape
+                    val mediaName = cinemeta?.name?.takeIf { it.isNotBlank() } ?: manualMediaName
                     val yearInt = cinemeta?.releaseInfo?.let { Regex("\\d{4}").find(it)?.value?.toIntOrNull() }
 
-                    val bestManualPoster = detailPosterUrl ?: manualPosterUrl
-                    val finalPosterUrl = getValidImageUrl(cinemeta?.poster, bestManualPoster)
+                    // We trust Cinemeta's CDN blindly on the list page to save HTTP Head requests
+                    val finalPosterUrl = cinemeta?.poster ?: fastDetailPoster ?: manualPosterUrl
 
                     newMovieSearchResponse(mediaName, mediaUrl, TvType.Movie) {
                         this.posterUrl = finalPosterUrl
@@ -186,11 +204,6 @@ class Film1kProvider : MainAPI() {
         }.awaitAll().filterNotNull()
     }
 
-    private fun extractImdbId(doc: Document): String? {
-        val href = doc.selectFirst("a[href*=imdb.com/title/]")?.attr("href") ?: return null
-        return Regex("tt\\d{7,8}").find(href)?.value
-    }
-
     private suspend fun fetchCinemetaData(imdbId: String): CinemetaMeta? {
         return try {
             val responseText = app.get("$cinemetaBaseUrl/$imdbId.json", cacheTime = 1440).text
@@ -198,10 +211,6 @@ class Film1kProvider : MainAPI() {
         } catch (e: Exception) {
             null
         }
-    }
-
-    private fun getBestTitle(manualTitle: String, cinemetaName: String?): String {
-        return cinemetaName?.takeIf { it.isNotBlank() } ?: manualTitle.ifBlank { "" }
     }
 
     private suspend fun fetchOpenSubtitles(imdbId: String): List<SubtitleFile> {
@@ -327,10 +336,13 @@ class Film1kProvider : MainAPI() {
         val tags2 = doc.select("#Ez-Wp > div > div.Container > div > aside > div > p:nth-child(6) > a").map { it.text() }
         val manualTags = (tags1 + tags2).filter { it.isNotBlank() }.distinct()
 
-        val imdbId = extractImdbId(doc)
+        val imdbId = Regex("imdb\\.com/title/(tt\\d+)").find(doc.html())?.groupValues?.get(1)
+            ?: Regex("tt\\d{7,8}").find(doc.html())?.value
+
         val cinemeta = imdbId?.let { fetchCinemetaData(it) }
 
-        val mediaName = getBestTitle(manualMediaName, cinemeta?.name)
+        // Guarantee fallback matches list page identically
+        val mediaName = cinemeta?.name?.takeIf { it.isNotBlank() } ?: manualMediaName
         val yearInt = cinemeta?.releaseInfo?.let { Regex("\\d{4}").find(it)?.value?.toIntOrNull() }
 
         val finalPosterUrl = getValidImageUrl(cinemeta?.poster, manualPosterUrl)
@@ -361,7 +373,6 @@ class Film1kProvider : MainAPI() {
             this.score = ratingText?.let { Score.from10(it) }
             this.duration = durationInt
             
-            // New native mappings 
             this.logoUrl = cinemeta?.logo
             this.contentRating = cinemeta?.certification
 
@@ -385,8 +396,10 @@ class Film1kProvider : MainAPI() {
         val collectingCallback: (ExtractorLink) -> Unit = { link -> collectedLinks.add(link) }
 
         val subtitleJob = async {
-            val doc = app.get(data, verify = false, cacheTime = 1440).document
-            val imdbId = extractImdbId(doc)
+            val docText = app.get(data, verify = false, cacheTime = 1440).text
+            val imdbId = Regex("imdb\\.com/title/(tt\\d+)").find(docText)?.groupValues?.get(1)
+                ?: Regex("tt\\d{7,8}").find(docText)?.value
+            
             if (imdbId != null) {
                 fetchOpenSubtitles(imdbId)
             } else emptyList()
