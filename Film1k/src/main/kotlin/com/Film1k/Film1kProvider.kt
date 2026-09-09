@@ -318,8 +318,8 @@ class Film1kProvider : MainAPI() {
 
         val durationInt = cinemeta?.runtime?.let { Regex("\\d+").find(it)?.value?.toIntOrNull() }
         
-        // Cloudstream ratings are integers representing thousands (e.g., 8.5 becomes 8500)
-        val ratingInt = cinemeta?.imdbRating?.toFloatOrNull()?.let { (it * 1000).toInt() }
+        // Cloudstream ratings now use 'score' as a Double/Float instead of the old 'rating' Int system
+        val scoreDecimal = cinemeta?.imdbRating?.toDoubleOrNull()
 
         val recommendations = extractRecommendations(doc)
 
@@ -330,7 +330,7 @@ class Film1kProvider : MainAPI() {
             this.plot = plot
             this.tags = allTags.distinct() // Prevents duplicate chips
             this.duration = durationInt
-            this.rating = ratingInt
+            this.score = scoreDecimal // FIX: Replaced the deprecated 'this.rating' property
             if (allActors.isNotEmpty()) {
                 this.actors = allActors
             }
