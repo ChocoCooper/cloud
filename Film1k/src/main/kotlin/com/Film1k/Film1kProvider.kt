@@ -6,10 +6,10 @@ import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.withTimeoutOrNull
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.jsoup.nodes.TextNode
-import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 
 data class OmdbResponse(
@@ -58,9 +58,6 @@ class Film1kProvider : MainAPI() {
         "efbd8357"
     )
 
-    // Atomic integer to keep track of our round-robin key distribution
-    private val currentKeyIndex = AtomicInteger(0)
-
     // Stremio community OpenSubtitles addon - no API key required.
     private val openSubtitlesBaseUrl = "https://opensubtitles-v3.strem.io/subtitles/movie"
     private val openSubtitlesMaxResults = 10
@@ -101,6 +98,25 @@ class Film1kProvider : MainAPI() {
         return manualPoster ?: ogPoster
     }
 
+    // Validates if OMDb poster actually exists (fixing Amazon 404 issues). 
+    // Uses 24hr cache so we only check broken links once per day.
+    private suspend fun getValidPoster(omdbPoster: String?, manualPoster: String?): String? {
+        val primary = omdbPoster?.takeIf { it.isNotBlank() && !it.equals("N/A", ignoreCase = true) }
+        val fallback = manualPoster?.takeIf { it.isNotBlank() }
+
+        if (primary == null) return fallback
+
+        return try {
+            val isValid = withTimeoutOrNull(5000) {
+                app.get(primary, cacheTime = 1440).code == 200
+            } ?: false
+            
+            if (isValid) primary else fallback
+        } catch (e: Exception) {
+            fallback
+        }
+    }
+
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
@@ -134,7 +150,6 @@ class Film1kProvider : MainAPI() {
             emptyList()
         }
 
-        // Page 2 is only worth its cost when page 1 alone didn't give a solid result set.
         val page2Items = if (page1Items.size < 10) {
             try {
                 val page2Url = "$mainUrl/page/2?s=$query"
@@ -164,30 +179,28 @@ class Film1kProvider : MainAPI() {
                     ?: aHeader.text().trim()
                 val manualMediaName = cleanTitle(rawName)
 
-                // Simpler image selector to capture more cases on search pages
-                val imgEl = article.selectFirst("img")
+                // Exact selector as requested, falling back to general img if layout changes
+                val imgEl = article.selectFirst("header > a > figure > img") ?: article.selectFirst("img")
                 val manualPosterUrl = getImageUrl(imgEl)?.let { fixUrl(it) }
 
-                // Fetch detail page. Because we are in an async block, these fetches happen in parallel.
                 var detailPosterUrl: String? = null
                 val omdb = try {
-                    val detailDoc = app.get(mediaUrl, verify = false).document
-                    // We grab the high-quality detail poster here just in case OMDb fails
+                    // Cached for 1440 mins (24 hours) to avoid hitting site limits
+                    val detailDoc = app.get(mediaUrl, verify = false, cacheTime = 1440).document
                     detailPosterUrl = extractDetailPoster(detailDoc)?.let { fixUrl(it) }
                     extractImdbId(detailDoc)?.let { fetchOmdbData(it) }
                 } catch (e: Exception) {
                     null
                 }
 
-                val mediaName = formatTitleWithYear(omdb?.Title, omdb?.Year) ?: manualMediaName
+                val mediaName = formatTitleWithYear(manualMediaName, omdb?.Title, omdb?.Year)
                 
-                // Priority fallback: OMDb > Detail Page Poster > Article Thumbnail Poster
-                val posterUrl = omdb?.Poster?.takeIf { it.isNotBlank() && !it.equals("N/A", ignoreCase = true) }
-                    ?: detailPosterUrl
-                    ?: manualPosterUrl
+                // Prioritize best available fallback: Detail Page Poster > Article Thumbnail Poster
+                val bestManualPoster = detailPosterUrl ?: manualPosterUrl
+                val finalPosterUrl = getValidPoster(omdb?.Poster, bestManualPoster)
 
                 newMovieSearchResponse(mediaName, mediaUrl, TvType.Movie) {
-                    this.posterUrl = posterUrl
+                    this.posterUrl = finalPosterUrl
                 }
             }
         }.awaitAll().filterNotNull()
@@ -198,11 +211,13 @@ class Film1kProvider : MainAPI() {
         return Regex("tt\\d+").find(href)?.value
     }
 
-    // Distributes requests across all keys concurrently, acting identically for Homepage AND Search pages
     private suspend fun fetchOmdbData(imdbId: String): OmdbResponse? {
         if (omdbApiKeys.isEmpty()) return null
         
-        val primaryKeyIndex = abs(currentKeyIndex.getAndIncrement()) % omdbApiKeys.size
+        // Use a deterministic hash of the IMDb ID to pick the key.
+        // This guarantees perfect load distribution AND ensures OkHttp caching works, 
+        // since the same movie will consistently request using the same API key URL!
+        val primaryKeyIndex = abs(imdbId.hashCode()) % omdbApiKeys.size
         val primaryKey = omdbApiKeys[primaryKeyIndex]
 
         fetchOmdbWithKey(imdbId, primaryKey)?.let { return it }
@@ -220,9 +235,11 @@ class Film1kProvider : MainAPI() {
 
     private suspend fun fetchOmdbWithKey(imdbId: String, key: String): OmdbResponse? {
         return try {
+            // Cache OMDb data for 1440 mins (24 hours)
             val responseText = app.get(
                 "https://www.omdbapi.com/?i=$imdbId&apikey=$key&plot=full",
-                verify = false
+                verify = false,
+                cacheTime = 1440
             ).text
             tryParseJson<OmdbResponse>(responseText)
                 ?.takeIf { it.Response?.equals("True", ignoreCase = true) == true }
@@ -231,10 +248,18 @@ class Film1kProvider : MainAPI() {
         }
     }
 
-    private fun formatTitleWithYear(title: String?, year: String?): String? {
-        val cleanedTitle = title?.takeIf { it.isNotBlank() && !it.equals("N/A", ignoreCase = true) } ?: return null
+    // Ensures we prioritize the English title extracted directly from the site
+    private fun formatTitleWithYear(manualTitle: String, omdbTitle: String?, year: String?): String {
+        val baseTitle = manualTitle.takeIf { it.isNotBlank() }
+            ?: omdbTitle?.takeIf { it.isNotBlank() && !it.equals("N/A", ignoreCase = true) }
+            ?: return ""
+            
         val cleanedYear = year?.let { Regex("\\d{4}").find(it)?.value }
-        return if (cleanedYear != null) "$cleanedTitle ($cleanedYear)" else cleanedTitle
+        return if (cleanedYear != null && !baseTitle.contains(cleanedYear)) {
+            "$baseTitle ($cleanedYear)"
+        } else {
+            baseTitle
+        }
     }
 
     private suspend fun fetchOpenSubtitles(imdbId: String): List<SubtitleFile> {
@@ -280,7 +305,7 @@ class Film1kProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val doc = app.get(url, verify = false).document
+        val doc = app.get(url, verify = false, cacheTime = 1440).document
 
         // ---- Manual extraction (used as fallback if no IMDb id / OMDb lookup fails) ----
         val manualPosterUrl = extractDetailPoster(doc)?.let { fixUrl(it) }
@@ -364,10 +389,9 @@ class Film1kProvider : MainAPI() {
         val imdbId = extractImdbId(doc)
         val omdb = imdbId?.let { fetchOmdbData(it) }
 
-        val mediaName = formatTitleWithYear(omdb?.Title, omdb?.Year) ?: manualMediaName
+        val mediaName = formatTitleWithYear(manualMediaName, omdb?.Title, omdb?.Year)
 
-        val posterUrl = omdb?.Poster?.takeIf { it.isNotBlank() && !it.equals("N/A", ignoreCase = true) }
-            ?: manualPosterUrl
+        val finalPosterUrl = getValidPoster(omdb?.Poster, manualPosterUrl)
 
         val plot = omdb?.Plot?.takeIf { it.isNotBlank() && !it.equals("N/A", ignoreCase = true) }
             ?: manualPlot
@@ -387,8 +411,8 @@ class Film1kProvider : MainAPI() {
         val recommendations = extractRecommendations(doc)
 
         return newMovieLoadResponse(mediaName, url, TvType.Movie, url) {
-            this.posterUrl = posterUrl
-            this.backgroundPosterUrl = posterUrl
+            this.posterUrl = finalPosterUrl
+            this.backgroundPosterUrl = finalPosterUrl
             this.plot = plot
             this.tags = allTags
             if (actorsList.isNotEmpty()) {
@@ -409,7 +433,6 @@ class Film1kProvider : MainAPI() {
         val doc = app.get(data, verify = false).document
         val extractedUrls = mutableSetOf<String>()
 
-        // ---- English subtitles via OpenSubtitles, sorted by popularity (download_count) ----
         val imdbId = extractImdbId(doc)
         if (imdbId != null) {
             fetchOpenSubtitles(imdbId).forEach { subtitleCallback(it) }
@@ -475,7 +498,7 @@ class Film1kProvider : MainAPI() {
                         this.quality = Qualities.Unknown.value
                     }
                 )
-                emitted = true // Break after the first valid link is sent
+                emitted = true 
             }
         }
 
