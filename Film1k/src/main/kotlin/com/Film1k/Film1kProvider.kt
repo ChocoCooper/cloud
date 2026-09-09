@@ -2,14 +2,18 @@ package com.Film1k
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.jsoup.nodes.TextNode
+import org.json.JSONObject
+import java.util.Calendar
+import java.util.TimeZone
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
 
 data class OmdbResponse(
@@ -19,7 +23,9 @@ data class OmdbResponse(
     val Poster: String? = null,
     val Genre: String? = null,
     val Actors: String? = null,
-    val Response: String? = null
+    val Response: String? = null,
+    val imdbRating: String? = null,
+    val Runtime: String? = null
 )
 
 data class StremioSubtitle(
@@ -57,6 +63,36 @@ class Film1kProvider : MainAPI() {
         "73a9858a",
         "efbd8357"
     )
+
+    // Dead Key Registry: thread-safe map of key -> retry-after timestamp (millis).
+    // A key that hits its daily limit gets parked until the next UTC midnight (when
+    // OMDb's quota resets) instead of being excluded forever, and ConcurrentHashMap
+    // makes this safe to read/write from many parallel coroutines at once.
+    private val deadOmdbKeys = ConcurrentHashMap<String, Long>()
+
+    private fun isKeyDead(key: String): Boolean {
+        val deadUntil = deadOmdbKeys[key] ?: return false
+        if (System.currentTimeMillis() >= deadUntil) {
+            deadOmdbKeys.remove(key)
+            return false
+        }
+        return true
+    }
+
+    private fun markKeyDead(key: String) {
+        val cal = Calendar.getInstance(TimeZone.getTimeZone("UTC"))
+        cal.add(Calendar.DAY_OF_YEAR, 1)
+        cal.set(Calendar.HOUR_OF_DAY, 0)
+        cal.set(Calendar.MINUTE, 0)
+        cal.set(Calendar.SECOND, 0)
+        cal.set(Calendar.MILLISECOND, 0)
+        deadOmdbKeys[key] = cal.timeInMillis
+    }
+
+    // Caps how many listing items are processed concurrently (each item does a detail-page
+    // fetch + OMDb lookup(s) + poster validation), so we don't fire dozens of simultaneous
+    // connections at film1k.com/omdbapi.com/the poster CDN all at once.
+    private val listingConcurrency = Semaphore(5)
 
     // Stremio community OpenSubtitles addon - no API key required.
     private val openSubtitlesBaseUrl = "https://opensubtitles-v3.strem.io/subtitles/movie"
@@ -98,8 +134,8 @@ class Film1kProvider : MainAPI() {
         return manualPoster ?: ogPoster
     }
 
-    // Validates if OMDb poster actually exists (fixing Amazon 404 issues). 
-    // Uses 24hr cache so we only check broken links once per day.
+    // Validates if OMDb poster actually exists (fixing Amazon 404 issues), using a HEAD
+    // request so we don't download the full image just to read a status code.
     private suspend fun getValidPoster(omdbPoster: String?, manualPoster: String?): String? {
         val primary = omdbPoster?.takeIf { it.isNotBlank() && !it.equals("N/A", ignoreCase = true) }
         val fallback = manualPoster?.takeIf { it.isNotBlank() }
@@ -107,10 +143,7 @@ class Film1kProvider : MainAPI() {
         if (primary == null) return fallback
 
         return try {
-            val isValid = withTimeoutOrNull(5000) {
-                app.get(primary, cacheTime = 1440).code == 200
-            } ?: false
-            
+            val isValid = app.head(primary, cacheTime = 1440).code == 200
             if (isValid) primary else fallback
         } catch (e: Exception) {
             fallback
@@ -171,36 +204,38 @@ class Film1kProvider : MainAPI() {
 
         articles.map { article ->
             async {
-                val aHeader = article.selectFirst("header > a") ?: article.selectFirst("a") ?: return@async null
-                val mediaUrl = fixUrl(aHeader.attr("href"))
-                if (mediaUrl.isBlank()) return@async null
+                listingConcurrency.withPermit {
+                    val aHeader = article.selectFirst("header > a") ?: article.selectFirst("a") ?: return@withPermit null
+                    val mediaUrl = fixUrl(aHeader.attr("href"))
+                    if (mediaUrl.isBlank()) return@withPermit null
 
-                val rawName = article.selectFirst("h2")?.text()?.trim()?.takeIf { it.isNotBlank() }
-                    ?: aHeader.text().trim()
-                val manualMediaName = cleanTitle(rawName)
+                    val rawName = article.selectFirst("h2")?.text()?.trim()?.takeIf { it.isNotBlank() }
+                        ?: aHeader.text().trim()
+                    val manualMediaName = cleanTitle(rawName)
 
-                // Exact selector as requested, falling back to general img if layout changes
-                val imgEl = article.selectFirst("header > a > figure > img") ?: article.selectFirst("img")
-                val manualPosterUrl = getImageUrl(imgEl)?.let { fixUrl(it) }
+                    val imgEl = article.selectFirst("header > a > figure > img") ?: article.selectFirst("img")
+                    val manualPosterUrl = getImageUrl(imgEl)?.let { fixUrl(it) }
 
-                var detailPosterUrl: String? = null
-                val omdb = try {
-                    // Cached for 1440 mins (24 hours) to avoid hitting site limits
-                    val detailDoc = app.get(mediaUrl, verify = false, cacheTime = 1440).document
-                    detailPosterUrl = extractDetailPoster(detailDoc)?.let { fixUrl(it) }
-                    extractImdbId(detailDoc)?.let { fetchOmdbData(it) }
-                } catch (e: Exception) {
-                    null
-                }
+                    var detailPosterUrl: String? = null
+                    val omdb = try {
+                        // Cached for 24 hours to prevent duplicate detail fetches for the same search
+                        val detailDoc = app.get(mediaUrl, verify = false, cacheTime = 1440).document
+                        detailPosterUrl = extractDetailPoster(detailDoc)?.let { fixUrl(it) }
+                        extractImdbId(detailDoc)?.let { fetchOmdbData(it) }
+                    } catch (e: Exception) {
+                        null
+                    }
 
-                val mediaName = formatTitleWithYear(manualMediaName, omdb?.Title, omdb?.Year)
-                
-                // Prioritize best available fallback: Detail Page Poster > Article Thumbnail Poster
-                val bestManualPoster = detailPosterUrl ?: manualPosterUrl
-                val finalPosterUrl = getValidPoster(omdb?.Poster, bestManualPoster)
+                    val mediaName = getBestTitle(manualMediaName, omdb?.Title, omdb?.Year)
+                    val yearInt = omdb?.Year?.let { Regex("\\d{4}").find(it)?.value?.toIntOrNull() }
 
-                newMovieSearchResponse(mediaName, mediaUrl, TvType.Movie) {
-                    this.posterUrl = finalPosterUrl
+                    val bestManualPoster = detailPosterUrl ?: manualPosterUrl
+                    val finalPosterUrl = getValidPoster(omdb?.Poster, bestManualPoster)
+
+                    newMovieSearchResponse(mediaName, mediaUrl, TvType.Movie) {
+                        this.posterUrl = finalPosterUrl
+                        this.year = yearInt
+                    }
                 }
             }
         }.awaitAll().filterNotNull()
@@ -212,76 +247,113 @@ class Film1kProvider : MainAPI() {
     }
 
     private suspend fun fetchOmdbData(imdbId: String): OmdbResponse? {
-        if (omdbApiKeys.isEmpty()) return null
-        
-        // Use a deterministic hash of the IMDb ID to pick the key.
-        // This guarantees perfect load distribution AND ensures OkHttp caching works, 
-        // since the same movie will consistently request using the same API key URL!
-        val primaryKeyIndex = abs(imdbId.hashCode()) % omdbApiKeys.size
-        val primaryKey = omdbApiKeys[primaryKeyIndex]
+        // Filter out keys that are currently parked (hit their daily limit)
+        val availableKeys = omdbApiKeys.filterNot { isKeyDead(it) }
+        if (availableKeys.isEmpty()) return null
+
+        // Deterministic hash based on available keys length, so the same title tends to
+        // reuse the same key across calls (cache-friendly) while spreading load overall.
+        val primaryKeyIndex = abs(imdbId.hashCode()) % availableKeys.size
+        val primaryKey = availableKeys[primaryKeyIndex]
 
         fetchOmdbWithKey(imdbId, primaryKey)?.let { return it }
 
-        val remainingKeys = omdbApiKeys.filterIndexed { index, _ -> index != primaryKeyIndex }
-        if (remainingKeys.isEmpty()) return null
-
-        return coroutineScope {
-            remainingKeys
-                .map { key -> async { fetchOmdbWithKey(imdbId, key) } }
-                .awaitAll()
-                .firstOrNull { it != null }
+        // Sequential fallback: try up to 2 other available keys to avoid flooding the API.
+        val fallbackKeys = availableKeys.filter { it != primaryKey && !isKeyDead(it) }.shuffled().take(2)
+        for (key in fallbackKeys) {
+            fetchOmdbWithKey(imdbId, key)?.let { return it }
         }
+
+        return null
     }
 
     private suspend fun fetchOmdbWithKey(imdbId: String, key: String): OmdbResponse? {
         return try {
-            // Cache OMDb data for 1440 mins (24 hours)
-            val responseText = app.get(
+            val response = app.get(
                 "https://www.omdbapi.com/?i=$imdbId&apikey=$key&plot=full",
                 verify = false,
                 cacheTime = 1440
-            ).text
-            tryParseJson<OmdbResponse>(responseText)
-                ?.takeIf { it.Response?.equals("True", ignoreCase = true) == true }
+            )
+            val responseText = response.text
+
+            // Check for rate limiting and park the key until the next UTC reset
+            if (responseText.contains("Request limit reached", ignoreCase = true) ||
+                responseText.contains("Invalid API key", ignoreCase = true)
+            ) {
+                markKeyDead(key)
+                return null
+            }
+
+            val json = JSONObject(responseText)
+            if (json.optString("Response", "").equals("True", ignoreCase = true)) {
+                OmdbResponse(
+                    Title = json.optString("Title").takeIf { it.isNotBlank() },
+                    Year = json.optString("Year").takeIf { it.isNotBlank() },
+                    Plot = json.optString("Plot").takeIf { it.isNotBlank() },
+                    Poster = json.optString("Poster").takeIf { it.isNotBlank() },
+                    Genre = json.optString("Genre").takeIf { it.isNotBlank() },
+                    Actors = json.optString("Actors").takeIf { it.isNotBlank() },
+                    Response = json.optString("Response").takeIf { it.isNotBlank() },
+                    imdbRating = json.optString("imdbRating").takeIf { it.isNotBlank() },
+                    Runtime = json.optString("Runtime").takeIf { it.isNotBlank() }
+                )
+            } else null
         } catch (e: Exception) {
             null
         }
     }
 
-    // Ensures we prioritize the English title extracted directly from the site
-    private fun formatTitleWithYear(manualTitle: String, omdbTitle: String?, year: String?): String {
-        val baseTitle = manualTitle.takeIf { it.isNotBlank() }
-            ?: omdbTitle?.takeIf { it.isNotBlank() && !it.equals("N/A", ignoreCase = true) }
-            ?: return ""
-            
-        val cleanedYear = year?.let { Regex("\\d{4}").find(it)?.value }
-        return if (cleanedYear != null && !baseTitle.contains(cleanedYear)) {
-            "$baseTitle ($cleanedYear)"
-        } else {
-            baseTitle
+    // OMDb's title is the priority whenever we have one - it's the accurate, canonical
+    // title. The scraped site title is only ever a fallback for items OMDb has no entry for.
+    private fun getBestTitle(manualTitle: String, omdbTitle: String?, omdbYear: String?): String {
+        val cleanedOmdbTitle = omdbTitle?.takeIf { it.isNotBlank() && !it.equals("N/A", ignoreCase = true) }
+        if (cleanedOmdbTitle != null) {
+            val year = omdbYear?.let { Regex("\\d{4}").find(it)?.value }
+            return if (year != null) "$cleanedOmdbTitle ($year)" else cleanedOmdbTitle
         }
+        return manualTitle.ifBlank { "" }
     }
 
     private suspend fun fetchOpenSubtitles(imdbId: String): List<SubtitleFile> {
         val requestUrl = "$openSubtitlesBaseUrl/$imdbId.json"
 
         val responseText = try {
-            app.get(requestUrl).text
+            app.get(requestUrl, cacheTime = 1440).text
         } catch (e: Exception) {
             return emptyList()
         }
 
-        val parsed = tryParseJson<StremioSubtitlesResponse>(responseText) ?: return emptyList()
+        val subtitlesList = mutableListOf<StremioSubtitle>()
+        try {
+            val json = JSONObject(responseText)
+            val subsArray = json.optJSONArray("subtitles")
+            if (subsArray != null) {
+                for (i in 0 until subsArray.length()) {
+                    val subObj = subsArray.optJSONObject(i) ?: continue
+                    subtitlesList.add(
+                        StremioSubtitle(
+                            url = subObj.optString("url").takeIf { it.isNotBlank() },
+                            lang = subObj.optString("lang").takeIf { it.isNotBlank() },
+                            score = if (subObj.has("score")) subObj.optDouble("score") else null,
+                            downloads = if (subObj.has("downloads")) subObj.optInt("downloads") else null
+                        )
+                    )
+                }
+            }
+        } catch (e: Exception) {
+            return emptyList()
+        }
 
-        return parsed.subtitles
-            ?.filter { it.lang.equals("eng", ignoreCase = true) && !it.url.isNullOrBlank() }
-            ?.sortedWith(
+        // Accept both "eng" (this addon's usual ISO 639-2 code) and "en" as a safety net,
+        // in case the addon (or a future replacement) ever returns the two-letter form.
+        return subtitlesList
+            .filter { it.lang?.lowercase() in listOf("eng", "en") && !it.url.isNullOrBlank() }
+            .sortedWith(
                 compareByDescending<StremioSubtitle> { it.downloads ?: -1 }
                     .thenByDescending { it.score ?: -1.0 }
             )
-            ?.take(openSubtitlesMaxResults)
-            ?.mapNotNull { sub -> sub.url?.let { SubtitleFile("English", it) } }
-            ?: emptyList()
+            .take(openSubtitlesMaxResults)
+            .mapNotNull { sub -> sub.url?.let { SubtitleFile("English", it) } }
     }
 
     private fun extractRecommendations(doc: Document): List<SearchResponse> {
@@ -389,7 +461,8 @@ class Film1kProvider : MainAPI() {
         val imdbId = extractImdbId(doc)
         val omdb = imdbId?.let { fetchOmdbData(it) }
 
-        val mediaName = formatTitleWithYear(manualMediaName, omdb?.Title, omdb?.Year)
+        val mediaName = getBestTitle(manualMediaName, omdb?.Title, omdb?.Year)
+        val yearInt = omdb?.Year?.let { Regex("\\d{4}").find(it)?.value?.toIntOrNull() }
 
         val finalPosterUrl = getValidPoster(omdb?.Poster, manualPosterUrl)
 
@@ -408,13 +481,27 @@ class Film1kProvider : MainAPI() {
             ?.filter { it.isNotBlank() }
             ?: emptyList()
 
+        // imdbRating is a "X.X" string out of 10 - Cloudstream expects an Int out of 100.
+        val ratingInt = omdb?.imdbRating
+            ?.takeIf { it.isNotBlank() && !it.equals("N/A", ignoreCase = true) }
+            ?.toDoubleOrNull()
+            ?.let { (it * 10).toInt() }
+
+        // Runtime comes back as e.g. "98 min" - Cloudstream's duration field wants minutes as an Int.
+        val durationInt = omdb?.Runtime
+            ?.takeIf { it.isNotBlank() && !it.equals("N/A", ignoreCase = true) }
+            ?.let { Regex("\\d+").find(it)?.value?.toIntOrNull() }
+
         val recommendations = extractRecommendations(doc)
 
         return newMovieLoadResponse(mediaName, url, TvType.Movie, url) {
             this.posterUrl = finalPosterUrl
             this.backgroundPosterUrl = finalPosterUrl
+            this.year = yearInt
             this.plot = plot
             this.tags = allTags
+            this.rating = ratingInt
+            this.duration = durationInt
             if (actorsList.isNotEmpty()) {
                 this.actors = actorsList.map { ActorData(Actor(it)) }
             }
@@ -498,7 +585,7 @@ class Film1kProvider : MainAPI() {
                         this.quality = Qualities.Unknown.value
                     }
                 )
-                emitted = true 
+                emitted = true
             }
         }
 
