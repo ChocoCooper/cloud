@@ -114,54 +114,39 @@ class Film1kProvider : MainAPI() {
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-        val usaDoc = app.get("$mainUrl/tag/usa", verify = false).document
-        val nintiesDoc = app.get("$mainUrl/tag/1990s", verify = false).document
-
-        val homePageList = mutableListOf<HomePageList>()
-
-        val usaTitle = usaDoc.selectFirst("#Ez-Wp > div > div > div > main > section > div.page-top > h3")?.text() ?: "USA Movies"
-        val usaItems = parseArticles(usaDoc, limit = 7)
-        if (usaItems.isNotEmpty()) {
-            homePageList.add(HomePageList(usaTitle, usaItems, isHorizontalImages = isHorizontalImages))
+        // This utilizes Cloudstream's native tab generation and pagination perfectly.
+        val url = if (page == 1) request.data else "${request.data}/page/$page/"
+        
+        val doc = try {
+            app.get(url, verify = false).document
+        } catch (e: Exception) {
+            return newHomePageResponse(emptyList())
         }
 
-        val nintiesTitle = nintiesDoc.selectFirst("#Ez-Wp > div > div > div > main > section > div.page-top > h3")?.text() ?: "1990s Movies"
-        val nintiesItems = parseArticles(nintiesDoc, limit = 7)
-        if (nintiesItems.isNotEmpty()) {
-            homePageList.add(HomePageList(nintiesTitle, nintiesItems, isHorizontalImages = isHorizontalImages))
-        }
-
-        return newHomePageResponse(homePageList)
+        val items = parseArticles(doc)
+        
+        return newHomePageResponse(
+            list = HomePageList(
+                name = request.name,
+                list = items,
+                isHorizontalImages = isHorizontalImages
+            ),
+            hasNext = items.isNotEmpty()
+        )
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val page1Url = "$mainUrl/?s=$query"
-
-        val page1Items = try {
-            parseArticles(app.get(page1Url, verify = false).document)
+        val doc = try {
+            app.get("$mainUrl/?s=$query", verify = false).document
         } catch (e: Exception) {
-            emptyList()
+            return emptyList()
         }
-
-        val page2Items = if (page1Items.size < 10) {
-            try {
-                val page2Url = "$mainUrl/page/2?s=$query"
-                parseArticles(app.get(page2Url, verify = false).document)
-            } catch (e: Exception) {
-                emptyList()
-            }
-        } else {
-            emptyList()
-        }
-
-        val seenUrls = mutableSetOf<String>()
-        return (page1Items + page2Items).filter { seenUrls.add(it.url) }
+        return parseArticles(doc)
     }
 
-    private suspend fun parseArticles(doc: Document, limit: Int? = null): List<SearchResponse> = coroutineScope {
-        val allArticles = doc.select("#Ez-Wp > div > div > div > main > section > article")
+    private suspend fun parseArticles(doc: Document): List<SearchResponse> = coroutineScope {
+        val articles = doc.select("#Ez-Wp > div > div > div > main > section > article")
             .ifEmpty { doc.select("main > section article") }
-        val articles = if (limit != null) allArticles.take(limit) else allArticles
 
         articles.map { article ->
             async {
@@ -215,7 +200,6 @@ class Film1kProvider : MainAPI() {
         }
     }
 
-    // Ensures we return just the pure title. The year is handled automatically by Cloudstream.
     private fun getBestTitle(manualTitle: String, cinemetaName: String?): String {
         return cinemetaName?.takeIf { it.isNotBlank() } ?: manualTitle.ifBlank { "" }
     }
@@ -351,12 +335,10 @@ class Film1kProvider : MainAPI() {
 
         val finalPosterUrl = getValidImageUrl(cinemeta?.poster, manualPosterUrl)
         val finalBackgroundUrl = getValidImageUrl(cinemeta?.background, finalPosterUrl)
-        val logoUrl = cinemeta?.logo
 
         val plot = cinemeta?.description?.takeIf { it.isNotBlank() } ?: manualPlot
         
         val allTags = mutableListOf<String>()
-        cinemeta?.certification?.takeIf { it.isNotBlank() }?.let { allTags.add(it) }
         cinemeta?.genres?.takeIf { it.isNotEmpty() }?.let { allTags.addAll(it) }
         if (allTags.isEmpty() && manualTags.isNotEmpty()) {
             allTags.addAll(manualTags)
@@ -379,9 +361,9 @@ class Film1kProvider : MainAPI() {
             this.score = ratingText?.let { Score.from10(it) }
             this.duration = durationInt
             
-            // This natively prioritizes the title image (logo) on supported layouts,
-            // otherwise it perfectly falls back to the clean, year-free text title!
-            this.logo = logoUrl
+            // New native mappings 
+            this.logoUrl = cinemeta?.logo
+            this.contentRating = cinemeta?.certification
 
             if (allActors.isNotEmpty()) {
                 this.actors = allActors
