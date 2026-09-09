@@ -6,6 +6,8 @@ import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.jsoup.nodes.TextNode
@@ -16,19 +18,17 @@ data class CinemetaResponse(
 
 data class CinemetaMeta(
     val name: String? = null,
-    val year: String? = null,
-    val releaseInfo: String? = null,
-    val description: String? = null,
+    val genres: List<String>? = null,
     val poster: String? = null,
     val background: String? = null,
-    val logo: String? = null,
-    val genres: List<String>? = null,
+    val logo: String? = null, 
+    val description: String? = null,
+    val releaseInfo: String? = null,
     val director: List<String>? = null,
     val cast: List<String>? = null,
-    val runtime: String? = null,
     val imdbRating: String? = null,
-    val language: String? = null,
-    val country: String? = null
+    val runtime: String? = null,
+    val certification: String? = null 
 )
 
 data class StremioSubtitle(
@@ -50,6 +50,12 @@ class Film1kProvider : MainAPI() {
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.NSFW)
 
+    // Cinemeta - Stremio's official metadata addon. No API key required.
+    private val cinemetaBaseUrl = "https://v3-cinemeta.strem.io/meta/movie"
+
+    // Caps how many listing items are processed concurrently to avoid network bottlenecking
+    private val listingConcurrency = Semaphore(5)
+
     // Stremio community OpenSubtitles addon
     private val openSubtitlesBaseUrl = "https://opensubtitles-v3.strem.io/subtitles/movie"
     private val openSubtitlesMaxResults = 10
@@ -61,9 +67,6 @@ class Film1kProvider : MainAPI() {
 
     private val isHorizontalImages = false
 
-    // Persistent disk cache for fast repeat lookups
-    private val imdbIdCache = mutableMapOf<String, String>()
-
     private val titleJunkRegex = Regex(
         "full movie online|movie poster watch online|watch movie online|watch tv online|watch series online|movie poster|watch online|film1k",
         RegexOption.IGNORE_CASE
@@ -72,7 +75,7 @@ class Film1kProvider : MainAPI() {
     private fun cleanTitle(raw: String): String {
         return raw
             .replace(titleJunkRegex, "")
-            .replace(Regex("\\(\\d{4}\\)"), "") // Automatically strip (YYYY) from site headers
+            .replace(Regex("\\(\\d{4}\\)"), "") // Strips (YYYY) automatically
             .replace(Regex("\\s+"), " ")
             .trim(' ', '-', '|', ':')
             .trim()
@@ -93,14 +96,14 @@ class Film1kProvider : MainAPI() {
         return manualPoster ?: ogPoster
     }
 
-    private suspend fun getValidPoster(cinemetaPoster: String?, manualPoster: String?): String? {
-        val primary = cinemetaPoster?.takeIf { it.isNotBlank() }
-        val fallback = manualPoster?.takeIf { it.isNotBlank() }
+    private suspend fun getValidImageUrl(primaryUrl: String?, fallbackUrl: String?): String? {
+        val primary = primaryUrl?.takeIf { it.isNotBlank() && !it.equals("N/A", ignoreCase = true) }
+        val fallback = fallbackUrl?.takeIf { it.isNotBlank() }
 
         if (primary == null) return fallback
 
         return try {
-            val isValid = app.get(primary, cacheTime = 1440).code == 200
+            val isValid = app.head(primary, cacheTime = 1440).code == 200
             if (isValid) primary else fallback
         } catch (e: Exception) {
             fallback
@@ -110,23 +113,25 @@ class Film1kProvider : MainAPI() {
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
-    ): HomePageResponse = coroutineScope {
-        val usaJob = async {
-            val usaDoc = app.get("$mainUrl/tag/usa", verify = false).document
-            val usaTitle = usaDoc.selectFirst("#Ez-Wp > div > div > div > main > section > div.page-top > h3")?.text() ?: "USA Movies"
-            val usaItems = parseArticles(usaDoc, limit = 7)
-            HomePageList(usaTitle, usaItems, isHorizontalImages = isHorizontalImages)
-        }
-        
-        val nintiesJob = async {
-            val nintiesDoc = app.get("$mainUrl/tag/1990s", verify = false).document
-            val nintiesTitle = nintiesDoc.selectFirst("#Ez-Wp > div > div > div > main > section > div.page-top > h3")?.text() ?: "1990s Movies"
-            val nintiesItems = parseArticles(nintiesDoc, limit = 7)
-            HomePageList(nintiesTitle, nintiesItems, isHorizontalImages = isHorizontalImages)
+    ): HomePageResponse {
+        val usaDoc = app.get("$mainUrl/tag/usa", verify = false).document
+        val nintiesDoc = app.get("$mainUrl/tag/1990s", verify = false).document
+
+        val homePageList = mutableListOf<HomePageList>()
+
+        val usaTitle = usaDoc.selectFirst("#Ez-Wp > div > div > div > main > section > div.page-top > h3")?.text() ?: "USA Movies"
+        val usaItems = parseArticles(usaDoc, limit = 7)
+        if (usaItems.isNotEmpty()) {
+            homePageList.add(HomePageList(usaTitle, usaItems, isHorizontalImages = isHorizontalImages))
         }
 
-        val homePageList = listOf(usaJob.await(), nintiesJob.await()).filter { it.list.isNotEmpty() }
-        newHomePageResponse(homePageList)
+        val nintiesTitle = nintiesDoc.selectFirst("#Ez-Wp > div > div > div > main > section > div.page-top > h3")?.text() ?: "1990s Movies"
+        val nintiesItems = parseArticles(nintiesDoc, limit = 7)
+        if (nintiesItems.isNotEmpty()) {
+            homePageList.add(HomePageList(nintiesTitle, nintiesItems, isHorizontalImages = isHorizontalImages))
+        }
+
+        return newHomePageResponse(homePageList)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
@@ -153,84 +158,89 @@ class Film1kProvider : MainAPI() {
         return (page1Items + page2Items).filter { seenUrls.add(it.url) }
     }
 
-    private suspend fun extractImdbIdFast(mediaUrl: String): String? {
-        imdbIdCache[mediaUrl]?.let { return it }
-
-        return try {
-            val rawHtml = app.get(mediaUrl, verify = false, cacheTime = 1440).text
-            // Strict regex ensures we only grab IMDb IDs attached to actual IMDb links!
-            val id = Regex("imdb\\.com/title/(tt\\d{7,8})").find(rawHtml)?.groupValues?.get(1)
-            if (id != null) {
-                imdbIdCache[mediaUrl] = id
-            }
-            id
-        } catch (e: Exception) {
-            null
-        }
-    }
-
-    private suspend fun fetchCinemetaData(imdbId: String): CinemetaResponse? {
-        return try {
-            val responseText = app.get("https://v3-cinemeta.strem.io/meta/movie/$imdbId.json", cacheTime = 1440).text
-            tryParseJson<CinemetaResponse>(responseText)
-        } catch (e: Exception) {
-            null
-        }
-    }
-
     private suspend fun parseArticles(doc: Document, limit: Int? = null): List<SearchResponse> = coroutineScope {
-        val allArticles = doc.select("main > section article")
+        val allArticles = doc.select("#Ez-Wp > div > div > div > main > section > article")
+            .ifEmpty { doc.select("main > section article") }
         val articles = if (limit != null) allArticles.take(limit) else allArticles
 
         articles.map { article ->
             async {
-                val aHeader = article.selectFirst("header > a") ?: article.selectFirst("a") ?: return@async null
-                val mediaUrl = fixUrl(aHeader.attr("href"))
-                if (mediaUrl.isBlank()) return@async null
+                listingConcurrency.withPermit {
+                    val aHeader = article.selectFirst("header > a") ?: article.selectFirst("a") ?: return@withPermit null
+                    val mediaUrl = fixUrl(aHeader.attr("href"))
+                    if (mediaUrl.isBlank()) return@withPermit null
 
-                val rawName = article.selectFirst("h2")?.text()?.trim()?.takeIf { it.isNotBlank() }
-                    ?: aHeader.text().trim()
-                val manualMediaName = cleanTitle(rawName)
+                    val rawName = article.selectFirst("h2")?.text()?.trim()?.takeIf { it.isNotBlank() }
+                        ?: aHeader.text().trim()
+                    val manualMediaName = cleanTitle(rawName)
 
-                val imgEl = article.selectFirst("header > a > figure > img") ?: article.selectFirst("img")
-                val manualPosterUrl = getImageUrl(imgEl)?.let { fixUrl(it) }
+                    val imgEl = article.selectFirst("header > a > figure > img") ?: article.selectFirst("img")
+                    val manualPosterUrl = getImageUrl(imgEl)?.let { fixUrl(it) }
 
-                val imdbId = extractImdbIdFast(mediaUrl)
-                val cinemeta = imdbId?.let { fetchCinemetaData(it) }?.meta
+                    var detailPosterUrl: String? = null
+                    val cinemeta = try {
+                        val detailDoc = app.get(mediaUrl, verify = false, cacheTime = 1440).document
+                        detailPosterUrl = extractDetailPoster(detailDoc)?.let { fixUrl(it) }
+                        extractImdbId(detailDoc)?.let { fetchCinemetaData(it) }
+                    } catch (e: Exception) {
+                        null
+                    }
 
-                val mediaName = manualMediaName.takeIf { it.isNotBlank() } ?: cinemeta?.name ?: ""
-                
-                val yearInt = cinemeta?.year?.let { Regex("\\d{4}").find(it)?.value?.toIntOrNull() }
-                    ?: cinemeta?.releaseInfo?.let { Regex("\\d{4}").find(it)?.value?.toIntOrNull() }
+                    val mediaName = getBestTitle(manualMediaName, cinemeta?.name)
+                    val yearInt = cinemeta?.releaseInfo?.let { Regex("\\d{4}").find(it)?.value?.toIntOrNull() }
 
-                val finalPosterUrl = getValidPoster(cinemeta?.poster, manualPosterUrl)
+                    val bestManualPoster = detailPosterUrl ?: manualPosterUrl
+                    val finalPosterUrl = getValidImageUrl(cinemeta?.poster, bestManualPoster)
 
-                newMovieSearchResponse(mediaName, mediaUrl, TvType.Movie) {
-                    this.posterUrl = finalPosterUrl
-                    this.year = yearInt
+                    newMovieSearchResponse(mediaName, mediaUrl, TvType.Movie) {
+                        this.posterUrl = finalPosterUrl
+                        this.year = yearInt
+                    }
                 }
             }
         }.awaitAll().filterNotNull()
     }
 
-    private suspend fun fetchOpenSubtitles(imdbId: String): List<SubtitleFile> {
+    private fun extractImdbId(doc: Document): String? {
+        val href = doc.selectFirst("a[href*=imdb.com/title/]")?.attr("href") ?: return null
+        return Regex("tt\\d{7,8}").find(href)?.value
+    }
+
+    private suspend fun fetchCinemetaData(imdbId: String): CinemetaMeta? {
         return try {
-            val requestUrl = "$openSubtitlesBaseUrl/$imdbId.json"
-            val responseText = app.get(requestUrl).text
-            val parsed = tryParseJson<StremioSubtitlesResponse>(responseText) ?: return emptyList()
-            
-            parsed.subtitles
-                ?.filter { it.lang.equals("eng", ignoreCase = true) && !it.url.isNullOrBlank() }
-                ?.sortedWith(
-                    compareByDescending<StremioSubtitle> { it.downloads ?: -1 }
-                        .thenByDescending { it.score ?: -1.0 }
-                )
-                ?.take(openSubtitlesMaxResults)
-                ?.mapNotNull { sub -> sub.url?.let { SubtitleFile("English", it) } }
-                ?: emptyList()
+            val responseText = app.get("$cinemetaBaseUrl/$imdbId.json", cacheTime = 1440).text
+            tryParseJson<CinemetaResponse>(responseText)?.meta
         } catch (e: Exception) {
-            emptyList()
+            null
         }
+    }
+
+    // Ensures we return just the pure title. The year is handled automatically by Cloudstream.
+    private fun getBestTitle(manualTitle: String, cinemetaName: String?): String {
+        return cinemetaName?.takeIf { it.isNotBlank() } ?: manualTitle.ifBlank { "" }
+    }
+
+    private suspend fun fetchOpenSubtitles(imdbId: String): List<SubtitleFile> {
+        val requestUrl = "$openSubtitlesBaseUrl/$imdbId.json"
+
+        val responseText = try {
+            app.get(requestUrl, cacheTime = 1440).text
+        } catch (e: Exception) {
+            return emptyList()
+        }
+
+        val parsed = tryParseJson<StremioSubtitlesResponse>(responseText) ?: return emptyList()
+
+        return parsed.subtitles
+            ?.filter { it.lang.equals("eng", ignoreCase = true) || it.lang.equals("en", ignoreCase = true) }
+            ?.filter { !it.url.isNullOrBlank() }
+            ?.sortedWith(
+                compareByDescending<StremioSubtitle> { it.downloads ?: -1 }
+                    .thenByDescending { it.score ?: -1.0 }
+            )
+            ?.take(openSubtitlesMaxResults)
+            ?.mapNotNull { sub -> sub.url?.let { SubtitleFile("English", it) } }
+            ?: emptyList()
     }
 
     private fun extractRecommendations(doc: Document): List<SearchResponse> {
@@ -254,16 +264,27 @@ class Film1kProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val doc = app.get(url, verify = false).document
+        val doc = app.get(url, verify = false, cacheTime = 1440).document
 
         val manualPosterUrl = extractDetailPoster(doc)?.let { fixUrl(it) }
-        val manualRawName = doc.selectFirst("h1.entry-title, h2.entry-title")?.text()?.trim()?.takeIf { it.isNotBlank() }
+
+        val manualRawName = doc.selectFirst("#Ez-Wp > div > div.Container > div > aside > div > div > img")?.attr("alt")?.takeIf { it.isNotBlank() }
+            ?: doc.selectFirst("h1.entry-title, h2.entry-title")?.text()?.trim()?.takeIf { it.isNotBlank() }
+            ?: doc.selectFirst("meta[property=og:title]")?.attr("content")?.takeIf { it.isNotBlank() }
             ?: doc.title()
+
         val manualMediaName = cleanTitle(manualRawName)
 
         var manualPlot: String? = null
         val descContainer = doc.selectFirst("#Ez-Wp > div > div.Container > div > aside > div > div")
-        
+
+        fun cleanupText(text: String): String {
+            return text
+                .replace(Regex("\\s+([.,;:!?])"), "$1")
+                .replace(Regex("\\s+"), " ")
+                .trim()
+        }
+
         fun extractAfterLabel(label: String): String? {
             val labelEl = descContainer?.select("strong, h3, b")?.firstOrNull {
                 it.text().trim().removeSuffix(":").trim().equals(label, ignoreCase = true)
@@ -272,46 +293,81 @@ class Film1kProvider : MainAPI() {
             val builder = StringBuilder()
             var sibling = labelEl.nextSibling()
             while (sibling != null) {
-                if (sibling is Element && sibling.tagName().lowercase() in listOf("h1", "h2", "h3", "h4", "strong", "b")) break
-                if (sibling is Element) builder.append(sibling.text()).append(" ")
-                else if (sibling is TextNode) builder.append(sibling.text()).append(" ")
+                if (sibling is Element) {
+                    val tagName = sibling.tagName().lowercase()
+                    if (tagName in listOf("h1", "h2", "h3", "h4", "strong", "b")) break
+                    builder.append(sibling.text()).append(" ")
+                } else if (sibling is TextNode) {
+                    builder.append(sibling.text()).append(" ")
+                }
                 sibling = sibling.nextSibling()
             }
-            val extracted = builder.toString().trim().removePrefix(",").removePrefix(":")
+
+            var extracted = cleanupText(builder.toString()).removePrefix(",").removePrefix(":").trim()
+            if (extracted.isBlank()) return null
+
+            val sentences = extracted.split(Regex("(?<=[.!?])\\s+"))
+            val filtered = sentences.filterNot { it.contains("Film1k", ignoreCase = true) }
+                .joinToString(" ").trim()
+            extracted = filtered.ifBlank { extracted }
+
             return extracted.ifBlank { null }
         }
-        manualPlot = extractAfterLabel("Description") ?: extractAfterLabel("Plot")
 
-        val manualTags = doc.select("#Ez-Wp > div > div.Container > div > aside > div > p > a")
-            .map { it.text() }.filter { it.isNotBlank() }.distinct()
+        fun extractTitleLeadParagraph(): String? {
+            val firstP = descContainer?.selectFirst("p") ?: return null
+            val leadStrong = firstP.selectFirst("strong") ?: return null
+            var text = firstP.text()
+            val titleText = leadStrong.text()
+            if (text.startsWith(titleText)) {
+                text = text.removePrefix(titleText)
+            }
+            text = cleanupText(text).removePrefix(",").removePrefix(":").trim()
+            if (text.isBlank()) return null
 
-        val imdbId = extractImdbIdFast(url)
-        val cinemeta = imdbId?.let { fetchCinemetaData(it) }?.meta
+            val sentences = text.split(Regex("(?<=[.!?])\\s+"))
+            val filtered = sentences.filterNot { it.contains("Film1k", ignoreCase = true) }
+                .joinToString(" ").trim()
+            return filtered.ifBlank { text }.ifBlank { null }
+        }
 
-        val mediaName = manualMediaName.takeIf { it.isNotBlank() } ?: cinemeta?.name ?: ""
-        
-        val yearInt = cinemeta?.year?.let { Regex("\\d{4}").find(it)?.value?.toIntOrNull() }
-            ?: cinemeta?.releaseInfo?.let { Regex("\\d{4}").find(it)?.value?.toIntOrNull() }
+        manualPlot = extractAfterLabel("Description") ?: extractAfterLabel("Plot") ?: extractTitleLeadParagraph()
 
-        val finalPosterUrl = getValidPoster(cinemeta?.poster, manualPosterUrl)
-        val finalBackgroundUrl = getValidPoster(cinemeta?.background, finalPosterUrl)
-        
+        manualPlot = manualPlot?.let { cleanupText(it) }
+            ?.replace("^\\s*:\\s*".toRegex(), "")
+            ?.replace("^\\s*\"|\"\\s*$".toRegex(), "")
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+
+        val tags1 = doc.select("#Ez-Wp > div > div.Container > div > aside > div > p:nth-child(4) > a").map { it.text() }
+        val tags2 = doc.select("#Ez-Wp > div > div.Container > div > aside > div > p:nth-child(6) > a").map { it.text() }
+        val manualTags = (tags1 + tags2).filter { it.isNotBlank() }.distinct()
+
+        val imdbId = extractImdbId(doc)
+        val cinemeta = imdbId?.let { fetchCinemetaData(it) }
+
+        val mediaName = getBestTitle(manualMediaName, cinemeta?.name)
+        val yearInt = cinemeta?.releaseInfo?.let { Regex("\\d{4}").find(it)?.value?.toIntOrNull() }
+
+        val finalPosterUrl = getValidImageUrl(cinemeta?.poster, manualPosterUrl)
+        val finalBackgroundUrl = getValidImageUrl(cinemeta?.background, finalPosterUrl)
+        val logoUrl = cinemeta?.logo
+
         val plot = cinemeta?.description?.takeIf { it.isNotBlank() } ?: manualPlot
         
         val allTags = mutableListOf<String>()
-        cinemeta?.genres?.let { allTags.addAll(it) }
+        cinemeta?.certification?.takeIf { it.isNotBlank() }?.let { allTags.add(it) }
+        cinemeta?.genres?.takeIf { it.isNotEmpty() }?.let { allTags.addAll(it) }
         if (allTags.isEmpty() && manualTags.isNotEmpty()) {
             allTags.addAll(manualTags)
         }
-        cinemeta?.language?.split(",")?.map { it.trim() }?.filter { it.isNotBlank() }?.let { allTags.addAll(it) }
-        cinemeta?.country?.split(",")?.map { it.trim() }?.filter { it.isNotBlank() }?.let { allTags.addAll(it) }
 
         val allActors = mutableListOf<ActorData>()
         cinemeta?.director?.forEach { dir -> allActors.add(ActorData(Actor(dir), roleString = "Director")) }
         cinemeta?.cast?.forEach { cast -> allActors.add(ActorData(Actor(cast), roleString = "Cast")) }
 
+        val ratingText = cinemeta?.imdbRating?.takeIf { it.isNotBlank() }
         val durationInt = cinemeta?.runtime?.let { Regex("\\d+").find(it)?.value?.toIntOrNull() }
-
         val recommendations = extractRecommendations(doc)
 
         return newMovieLoadResponse(mediaName, url, TvType.Movie, url) {
@@ -319,8 +375,14 @@ class Film1kProvider : MainAPI() {
             this.backgroundPosterUrl = finalBackgroundUrl
             this.year = yearInt
             this.plot = plot
-            this.tags = allTags.distinct() 
+            this.tags = allTags.distinct()
+            this.score = ratingText?.let { Score.from10(it) }
             this.duration = durationInt
+            
+            // This natively prioritizes the title image (logo) on supported layouts,
+            // otherwise it perfectly falls back to the clean, year-free text title!
+            this.logo = logoUrl
+
             if (allActors.isNotEmpty()) {
                 this.actors = allActors
             }
@@ -341,14 +403,15 @@ class Film1kProvider : MainAPI() {
         val collectingCallback: (ExtractorLink) -> Unit = { link -> collectedLinks.add(link) }
 
         val subtitleJob = async {
-            val imdbId = extractImdbIdFast(data)
+            val doc = app.get(data, verify = false, cacheTime = 1440).document
+            val imdbId = extractImdbId(doc)
             if (imdbId != null) {
                 fetchOpenSubtitles(imdbId)
             } else emptyList()
         }
 
         val htmlJob = async {
-            app.get(data, verify = false).document
+            app.get(data, verify = false, cacheTime = 1440).document
         }
 
         val doc = htmlJob.await()
