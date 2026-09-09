@@ -481,11 +481,9 @@ class Film1kProvider : MainAPI() {
             ?.filter { it.isNotBlank() }
             ?: emptyList()
 
-        // imdbRating is a "X.X" string out of 10 - Cloudstream expects an Int out of 100.
-        val ratingInt = omdb?.imdbRating
+        // imdbRating is an "X.X"/10 string - Score.from10 takes that format directly.
+        val ratingText = omdb?.imdbRating
             ?.takeIf { it.isNotBlank() && !it.equals("N/A", ignoreCase = true) }
-            ?.toDoubleOrNull()
-            ?.let { (it * 10).toInt() }
 
         // Runtime comes back as e.g. "98 min" - Cloudstream's duration field wants minutes as an Int.
         val durationInt = omdb?.Runtime
@@ -500,7 +498,7 @@ class Film1kProvider : MainAPI() {
             this.year = yearInt
             this.plot = plot
             this.tags = allTags
-            this.rating = ratingInt
+            this.score = ratingText?.let { Score.from10(it) }
             this.duration = durationInt
             if (actorsList.isNotEmpty()) {
                 this.actors = actorsList.map { ActorData(Actor(it)) }
