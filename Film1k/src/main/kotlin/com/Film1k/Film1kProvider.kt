@@ -12,6 +12,7 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.jsoup.nodes.TextNode
 
+// --- Cinemeta Data Classes ---
 data class CinemetaResponse(
     val meta: CinemetaMeta? = null
 )
@@ -31,6 +32,23 @@ data class CinemetaMeta(
     val country: String? = null
 )
 
+// --- WP-JSON Data Classes ---
+data class WpPost(
+    val link: String? = null,
+    val title: WpRendered? = null,
+    val content: WpRendered? = null,
+    val meta: WpMeta? = null
+)
+
+data class WpRendered(
+    val rendered: String? = null
+)
+
+data class WpMeta(
+    val fifu_image_url: String? = null
+)
+
+// --- Subtitle Data Classes ---
 data class StremioSubtitle(
     val id: String? = null,
     val url: String? = null,
@@ -50,24 +68,16 @@ class Film1kProvider : MainAPI() {
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.NSFW)
 
-    // Cinemeta - Stremio's official metadata addon.
     private val cinemetaBaseUrl = "https://v3-cinemeta.strem.io/meta/movie"
-
-    // Stremio community OpenSubtitles addon
     private val openSubtitlesBaseUrl = "https://opensubtitles-v3.strem.io/subtitles/movie"
     private val openSubtitlesMaxResults = 10
 
-    // Concurrency limit to prevent network timeouts when fetching detail IDs
     private val listingConcurrency = Semaphore(5)
-
-    // Memory cache to completely skip HTTP requests on repeat visits
-    private val imdbIdCache = mutableMapOf<String, String>()
-
     private val isHorizontalImages = false
 
     override val mainPage = mainPageOf(
-        "$mainUrl/tag/usa" to "USA Movies",
-        "$mainUrl/tag/1990s" to "1990s Movies"
+        "$mainUrl/wp-json/wp/v2/posts?tags=11" to "USA Movies",
+        "$mainUrl/wp-json/wp/v2/posts?tags=58" to "1990s Movies"
     )
 
     private val titleJunkRegex = Regex(
@@ -78,7 +88,7 @@ class Film1kProvider : MainAPI() {
     private fun cleanTitle(raw: String): String {
         return raw
             .replace(titleJunkRegex, "")
-            .replace(Regex("\\(\\d{4}\\)"), "") // Automatically strip (YYYY)
+            .replace(Regex("\\(\\d{4}\\)"), "") 
             .replace(Regex("\\s+"), " ")
             .trim(' ', '-', '|', ':')
             .trim()
@@ -117,16 +127,16 @@ class Film1kProvider : MainAPI() {
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-        val url = if (page == 1) request.data else "${request.data}/page/$page/"
+        val url = "${request.data}&page=$page"
         
-        val doc = try {
-            app.get(url, verify = false).document
+        val responseText = try {
+            app.get(url, verify = false).text
         } catch (e: Exception) {
             return newHomePageResponse(emptyList())
         }
 
-        // Limit items per page load to ensure instantaneous homepage startup
-        val items = parseArticles(doc, limit = 8)
+        val wpPosts = tryParseJson<List<WpPost>>(responseText) ?: emptyList()
+        val items = parseWpPosts(wpPosts)
         
         return newHomePageResponse(
             list = HomePageList(
@@ -139,60 +149,49 @@ class Film1kProvider : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val doc = try {
-            app.get("$mainUrl/?s=$query", verify = false).document
+        val apiUrl = "$mainUrl/wp-json/wp/v2/posts?search=$query&per_page=15"
+        
+        val responseText = try {
+            app.get(apiUrl, verify = false).text
         } catch (e: Exception) {
             return emptyList()
         }
-        return parseArticles(doc, limit = 12)
+
+        val wpPosts = tryParseJson<List<WpPost>>(responseText) ?: return emptyList()
+        return parseWpPosts(wpPosts)
     }
 
-    private suspend fun parseArticles(doc: Document, limit: Int? = null): List<SearchResponse> = coroutineScope {
-        val allArticles = doc.select("#Ez-Wp > div > div > div > main > section > article")
-            .ifEmpty { doc.select("main > section article") }
-        
-        val articles = if (limit != null) allArticles.take(limit) else allArticles
-
-        articles.map { article ->
+    // 🚀 ULTRA-FAST JSON PARSER (Shared by Homepage & Search)
+    private suspend fun parseWpPosts(wpPosts: List<WpPost>): List<SearchResponse> = coroutineScope {
+        wpPosts.map { post ->
             async {
                 listingConcurrency.withPermit {
-                    val aHeader = article.selectFirst("header > a") ?: article.selectFirst("a") ?: return@withPermit null
-                    val mediaUrl = fixUrl(aHeader.attr("href"))
-                    if (mediaUrl.isBlank()) return@withPermit null
-
-                    val rawName = article.selectFirst("h2")?.text()?.trim()?.takeIf { it.isNotBlank() }
-                        ?: aHeader.text().trim()
+                    val mediaUrl = post.link?.takeIf { it.isNotBlank() } ?: return@withPermit null
+                    val rawName = post.title?.rendered ?: return@withPermit null
                     val manualMediaName = cleanTitle(rawName)
 
-                    val imgEl = article.selectFirst("header > a > figure > img") ?: article.selectFirst("img")
-                    val manualPosterUrl = getImageUrl(imgEl)?.let { fixUrl(it) }
+                    var manualPosterUrl = post.meta?.fifu_image_url?.takeIf { it.isNotBlank() }
+                    if (manualPosterUrl == null) {
+                        manualPosterUrl = post.content?.rendered?.let { html ->
+                            Regex("src=\"([^\"]+)\"").find(html)?.groupValues?.get(1)
+                        }
+                    }
+                    manualPosterUrl = manualPosterUrl?.let { fixUrl(it) }
 
-                    // Lightning fast regex extraction - skips JSoup DOM building entirely
-                    var imdbId = imdbIdCache[mediaUrl]
-                    var fastDetailPoster: String? = null
-
-                    if (imdbId == null) {
-                        try {
-                            val detailText = app.get(mediaUrl, verify = false, cacheTime = 1440).text
-                            imdbId = Regex("imdb\\.com/title/(tt\\d+)").find(detailText)?.groupValues?.get(1)
-                                ?: Regex("tt\\d{7,8}").find(detailText)?.value
-                            
-                            if (imdbId != null) {
-                                imdbIdCache[mediaUrl] = imdbId
-                            }
-                            fastDetailPoster = Regex("property=\"og:image\"\\s+content=\"([^\"]+)\"").find(detailText)?.groupValues?.get(1)
-                        } catch (e: Exception) {}
+                    // Rip the IMDb ID straight out of the JSON HTML block!
+                    val imdbId = post.content?.rendered?.let { html ->
+                        Regex("imdb\\.com/title/(tt\\d+)").find(html)?.groupValues?.get(1)
+                            ?: Regex("tt\\d{7,8}").find(html)?.value
                     }
 
                     val cinemeta = imdbId?.let { fetchCinemetaData(it) }
 
-                    // Priority: Cinemeta -> Manual Scrape
                     val mediaName = cinemeta?.name?.takeIf { it.isNotBlank() } ?: manualMediaName
-                    
                     val yearInt = cinemeta?.year?.toIntOrNull() 
                         ?: cinemeta?.releaseInfo?.let { Regex("\\d{4}").find(it)?.value?.toIntOrNull() }
+                        ?: Regex("\\((\\d{4})\\)").find(rawName)?.groupValues?.get(1)?.toIntOrNull()
 
-                    val finalPosterUrl = cinemeta?.poster ?: fastDetailPoster ?: manualPosterUrl
+                    val finalPosterUrl = cinemeta?.poster ?: manualPosterUrl
 
                     newMovieSearchResponse(mediaName, mediaUrl, TvType.Movie) {
                         this.posterUrl = finalPosterUrl
@@ -340,7 +339,6 @@ class Film1kProvider : MainAPI() {
 
         val cinemeta = imdbId?.let { fetchCinemetaData(it) }
 
-        // Guarantee fallback matches list page identically
         val mediaName = cinemeta?.name?.takeIf { it.isNotBlank() } ?: manualMediaName
         val yearInt = cinemeta?.year?.toIntOrNull() 
             ?: cinemeta?.releaseInfo?.let { Regex("\\d{4}").find(it)?.value?.toIntOrNull() }
@@ -368,7 +366,6 @@ class Film1kProvider : MainAPI() {
         return newMovieLoadResponse(mediaName, url, TvType.Movie, url) {
             this.posterUrl = finalPosterUrl
             this.backgroundPosterUrl = finalBackgroundUrl
-            this.logoUrl = cinemeta?.logo
             this.year = yearInt
             this.plot = plot
             this.tags = allTags.distinct()
