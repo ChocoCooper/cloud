@@ -24,11 +24,11 @@ data class CinemetaMeta(
     val logo: String? = null, 
     val description: String? = null,
     val releaseInfo: String? = null,
-    val director: List<String>? = null,
+    val year: String? = null,
     val cast: List<String>? = null,
     val imdbRating: String? = null,
     val runtime: String? = null,
-    val certification: String? = null 
+    val country: String? = null
 )
 
 data class StremioSubtitle(
@@ -99,7 +99,6 @@ class Film1kProvider : MainAPI() {
         return manualPoster ?: ogPoster
     }
 
-    // Safely validates image URLs for load pages using HEAD requests
     private suspend fun getValidImageUrl(primaryUrl: String?, fallbackUrl: String?): String? {
         val primary = primaryUrl?.takeIf { it.isNotBlank() && !it.equals("N/A", ignoreCase = true) }
         val fallback = fallbackUrl?.takeIf { it.isNotBlank() }
@@ -126,7 +125,7 @@ class Film1kProvider : MainAPI() {
             return newHomePageResponse(emptyList())
         }
 
-        // We limit to 8 items per page load to ensure instantaneous homepage startup
+        // Limit items per page load to ensure instantaneous homepage startup
         val items = parseArticles(doc, limit = 8)
         
         return newHomePageResponse(
@@ -145,7 +144,6 @@ class Film1kProvider : MainAPI() {
         } catch (e: Exception) {
             return emptyList()
         }
-        // Limit search to 12 to ensure results return quickly
         return parseArticles(doc, limit = 12)
     }
 
@@ -190,9 +188,10 @@ class Film1kProvider : MainAPI() {
 
                     // Priority: Cinemeta -> Manual Scrape
                     val mediaName = cinemeta?.name?.takeIf { it.isNotBlank() } ?: manualMediaName
-                    val yearInt = cinemeta?.releaseInfo?.let { Regex("\\d{4}").find(it)?.value?.toIntOrNull() }
+                    
+                    val yearInt = cinemeta?.year?.toIntOrNull() 
+                        ?: cinemeta?.releaseInfo?.let { Regex("\\d{4}").find(it)?.value?.toIntOrNull() }
 
-                    // We trust Cinemeta's CDN blindly on the list page to save HTTP Head requests
                     val finalPosterUrl = cinemeta?.poster ?: fastDetailPoster ?: manualPosterUrl
 
                     newMovieSearchResponse(mediaName, mediaUrl, TvType.Movie) {
@@ -343,7 +342,8 @@ class Film1kProvider : MainAPI() {
 
         // Guarantee fallback matches list page identically
         val mediaName = cinemeta?.name?.takeIf { it.isNotBlank() } ?: manualMediaName
-        val yearInt = cinemeta?.releaseInfo?.let { Regex("\\d{4}").find(it)?.value?.toIntOrNull() }
+        val yearInt = cinemeta?.year?.toIntOrNull() 
+            ?: cinemeta?.releaseInfo?.let { Regex("\\d{4}").find(it)?.value?.toIntOrNull() }
 
         val finalPosterUrl = getValidImageUrl(cinemeta?.poster, manualPosterUrl)
         val finalBackgroundUrl = getValidImageUrl(cinemeta?.background, finalPosterUrl)
@@ -352,12 +352,13 @@ class Film1kProvider : MainAPI() {
         
         val allTags = mutableListOf<String>()
         cinemeta?.genres?.takeIf { it.isNotEmpty() }?.let { allTags.addAll(it) }
+        cinemeta?.country?.takeIf { it.isNotBlank() }?.let { allTags.add(it) }
+        
         if (allTags.isEmpty() && manualTags.isNotEmpty()) {
             allTags.addAll(manualTags)
         }
 
         val allActors = mutableListOf<ActorData>()
-        cinemeta?.director?.forEach { dir -> allActors.add(ActorData(Actor(dir), roleString = "Director")) }
         cinemeta?.cast?.forEach { cast -> allActors.add(ActorData(Actor(cast), roleString = "Cast")) }
 
         val ratingText = cinemeta?.imdbRating?.takeIf { it.isNotBlank() }
@@ -367,15 +368,13 @@ class Film1kProvider : MainAPI() {
         return newMovieLoadResponse(mediaName, url, TvType.Movie, url) {
             this.posterUrl = finalPosterUrl
             this.backgroundPosterUrl = finalBackgroundUrl
+            this.logoUrl = cinemeta?.logo
             this.year = yearInt
             this.plot = plot
             this.tags = allTags.distinct()
             this.score = ratingText?.let { Score.from10(it) }
             this.duration = durationInt
             
-            this.logoUrl = cinemeta?.logo
-            this.contentRating = cinemeta?.certification
-
             if (allActors.isNotEmpty()) {
                 this.actors = allActors
             }
