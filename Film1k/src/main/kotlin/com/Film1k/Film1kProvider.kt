@@ -99,7 +99,7 @@ class Film1kProvider : MainAPI() {
         if (primary == null) return fallback
 
         return try {
-            val isValid = app.get(primary).code == 200
+            val isValid = app.get(primary, cacheTime = 1440).code == 200
             if (isValid) primary else fallback
         } catch (e: Exception) {
             fallback
@@ -156,7 +156,7 @@ class Film1kProvider : MainAPI() {
         imdbIdCache[mediaUrl]?.let { return it }
 
         return try {
-            val rawHtml = app.get(mediaUrl, verify = false).text
+            val rawHtml = app.get(mediaUrl, verify = false, cacheTime = 1440).text
             val id = Regex("tt\\d{7,8}").find(rawHtml)?.value
             if (id != null) {
                 imdbIdCache[mediaUrl] = id
@@ -169,11 +169,8 @@ class Film1kProvider : MainAPI() {
 
     private suspend fun fetchCinemetaData(imdbId: String): CinemetaResponse? {
         return try {
-            val responseText = app.get("https://v3-cinemeta.strem.io/meta/movie/$imdbId.json").text
-            // Manually parse JSON without inline to avoid JVM target mismatch in older setups
-            val mapper = com.fasterxml.jackson.module.kotlin.jacksonObjectMapper()
-            mapper.configure(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
-            mapper.readValue(responseText, CinemetaResponse::class.java)
+            val responseText = app.get("https://v3-cinemeta.strem.io/meta/movie/$imdbId.json", cacheTime = 1440).text
+            tryParseJson<CinemetaResponse>(responseText)
         } catch (e: Exception) {
             null
         }
@@ -218,10 +215,7 @@ class Film1kProvider : MainAPI() {
         return try {
             val requestUrl = "$openSubtitlesBaseUrl/$imdbId.json"
             val responseText = app.get(requestUrl).text
-            
-            val mapper = com.fasterxml.jackson.module.kotlin.jacksonObjectMapper()
-            mapper.configure(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
-            val parsed = mapper.readValue(responseText, StremioSubtitlesResponse::class.java)
+            val parsed = tryParseJson<StremioSubtitlesResponse>(responseText) ?: return emptyList()
             
             parsed.subtitles
                 ?.filter { it.lang.equals("eng", ignoreCase = true) && !it.url.isNullOrBlank() }
@@ -302,24 +296,20 @@ class Film1kProvider : MainAPI() {
         
         val plot = cinemeta?.description?.takeIf { it.isNotBlank() } ?: manualPlot
         
-        // Map Genres, Country, and Language into Cloudstream's Tag Chips
+        // Map Genres, Country, and Language into Cloudstream's Tag Chips safely
         val allTags = mutableListOf<String>()
-        if (!cinemeta?.genres.isNullOrEmpty()) {
-            allTags.addAll(cinemeta!!.genres!!)
-        } else if (manualTags.isNotEmpty()) {
+        cinemeta?.genres?.let { allTags.addAll(it) }
+        if (allTags.isEmpty() && manualTags.isNotEmpty()) {
             allTags.addAll(manualTags)
         }
-        cinemeta?.language?.split(",")?.map { it.trim() }?.forEach { if (it.isNotBlank()) allTags.add(it) }
-        cinemeta?.country?.split(",")?.map { it.trim() }?.forEach { if (it.isNotBlank()) allTags.add(it) }
+        cinemeta?.language?.split(",")?.map { it.trim() }?.filter { it.isNotBlank() }?.let { allTags.addAll(it) }
+        cinemeta?.country?.split(",")?.map { it.trim() }?.filter { it.isNotBlank() }?.let { allTags.addAll(it) }
 
         val allActors = mutableListOf<ActorData>()
         cinemeta?.director?.forEach { dir -> allActors.add(ActorData(Actor(dir), roleString = "Director")) }
         cinemeta?.cast?.forEach { cast -> allActors.add(ActorData(Actor(cast), roleString = "Cast")) }
 
         val durationInt = cinemeta?.runtime?.let { Regex("\\d+").find(it)?.value?.toIntOrNull() }
-        
-        // Reverting back to native 'rating' property using Cloudstream's string extension
-        val parsedRating = cinemeta?.imdbRating?.toRatingInt()
 
         val recommendations = extractRecommendations(doc)
 
@@ -328,9 +318,8 @@ class Film1kProvider : MainAPI() {
             this.backgroundPosterUrl = finalBackgroundUrl
             this.year = yearInt
             this.plot = plot
-            this.tags = allTags.distinct() // Prevents duplicate chips
+            this.tags = allTags.distinct() 
             this.duration = durationInt
-            this.rating = parsedRating
             if (allActors.isNotEmpty()) {
                 this.actors = allActors
             }
