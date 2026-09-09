@@ -149,7 +149,8 @@ class Film1kProvider : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val apiUrl = "$mainUrl/wp-json/wp/v2/posts?search=$query&per_page=15"
+        // FIXED: Added &orderby=relevance to prevent WordPress from returning random date-ordered results
+        val apiUrl = "$mainUrl/wp-json/wp/v2/posts?search=$query&per_page=15&orderby=relevance"
         
         val responseText = try {
             app.get(apiUrl, verify = false).text
@@ -371,7 +372,7 @@ class Film1kProvider : MainAPI() {
         return newMovieLoadResponse(mediaName, url, TvType.Movie, url) {
             this.posterUrl = finalPosterUrl
             this.backgroundPosterUrl = finalBackgroundUrl
-            this.logoUrl = cinemeta?.logo // Prioritized Logo mapped here
+            this.logoUrl = cinemeta?.logo
             this.year = yearInt
             this.plot = plot
             this.tags = allTags.distinct()
