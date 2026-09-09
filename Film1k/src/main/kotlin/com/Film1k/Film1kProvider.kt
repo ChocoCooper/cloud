@@ -178,7 +178,7 @@ class Film1kProvider : MainAPI() {
                     }
                     manualPosterUrl = manualPosterUrl?.let { fixUrl(it) }
 
-                    // Rip the IMDb ID straight out of the JSON HTML block!
+                    // Rip the IMDb ID straight out of the JSON HTML block
                     val imdbId = post.content?.rendered?.let { html ->
                         Regex("imdb\\.com/title/(tt\\d+)").find(html)?.groupValues?.get(1)
                             ?: Regex("tt\\d{7,8}").find(html)?.value
@@ -186,6 +186,7 @@ class Film1kProvider : MainAPI() {
 
                     val cinemeta = imdbId?.let { fetchCinemetaData(it) }
 
+                    // Cinemeta Priority, Manual Fallback
                     val mediaName = cinemeta?.name?.takeIf { it.isNotBlank() } ?: manualMediaName
                     val yearInt = cinemeta?.year?.toIntOrNull() 
                         ?: cinemeta?.releaseInfo?.let { Regex("\\d{4}").find(it)?.value?.toIntOrNull() }
@@ -257,6 +258,7 @@ class Film1kProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url, verify = false, cacheTime = 1440).document
 
+        // --- Manual Scraping ---
         val manualPosterUrl = extractDetailPoster(doc)?.let { fixUrl(it) }
 
         val manualRawName = doc.selectFirst("#Ez-Wp > div > div.Container > div > aside > div > div > img")?.attr("alt")?.takeIf { it.isNotBlank() }
@@ -337,8 +339,10 @@ class Film1kProvider : MainAPI() {
         val imdbId = Regex("imdb\\.com/title/(tt\\d+)").find(doc.html())?.groupValues?.get(1)
             ?: Regex("tt\\d{7,8}").find(doc.html())?.value
 
+        // --- Cinemeta Enrichment ---
         val cinemeta = imdbId?.let { fetchCinemetaData(it) }
 
+        // --- Prioritized Resolution (Cinemeta first, then Manual) ---
         val mediaName = cinemeta?.name?.takeIf { it.isNotBlank() } ?: manualMediaName
         val yearInt = cinemeta?.year?.toIntOrNull() 
             ?: cinemeta?.releaseInfo?.let { Regex("\\d{4}").find(it)?.value?.toIntOrNull() }
@@ -352,6 +356,7 @@ class Film1kProvider : MainAPI() {
         cinemeta?.genres?.takeIf { it.isNotEmpty() }?.let { allTags.addAll(it) }
         cinemeta?.country?.takeIf { it.isNotBlank() }?.let { allTags.add(it) }
         
+        // Fallback to manual tags only if Cinemeta had absolutely nothing
         if (allTags.isEmpty() && manualTags.isNotEmpty()) {
             allTags.addAll(manualTags)
         }
@@ -366,6 +371,7 @@ class Film1kProvider : MainAPI() {
         return newMovieLoadResponse(mediaName, url, TvType.Movie, url) {
             this.posterUrl = finalPosterUrl
             this.backgroundPosterUrl = finalBackgroundUrl
+            this.logoUrl = cinemeta?.logo // Prioritized Logo mapped here
             this.year = yearInt
             this.plot = plot
             this.tags = allTags.distinct()
